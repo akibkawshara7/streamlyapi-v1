@@ -6,7 +6,7 @@ import { vidsyncRouter, subtitlesRouter } from './src/server/vidsync.js';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
