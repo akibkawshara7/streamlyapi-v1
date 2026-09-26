@@ -207,6 +207,71 @@ export interface FormattedStreamItem {
   quality: string;
 }
 
+export type LanguageProviderStreams = Record<string, Record<string, FormattedStreamItem[]>>;
+
+/**
+ * Extracts and formats provider name cleanly
+ */
+export function extractProviderName(rawProvider: any, sourceItem?: any): string {
+  let val = rawProvider;
+  if (!val && sourceItem) {
+    val = sourceItem.providerName || sourceItem.source || sourceItem.server || sourceItem.name;
+  }
+  if (!val) return 'Default';
+
+  let name = '';
+  if (typeof val === 'string') {
+    name = val.trim();
+  } else if (typeof val === 'object') {
+    name = val.name || val.id || 'Default';
+  } else {
+    name = String(val);
+  }
+
+  const clean = name.trim();
+  const lower = clean.toLowerCase();
+
+  const KNOWN_MAP: Record<string, string> = {
+    vidsrc: 'VidSrc',
+    vidzee: 'VidZee',
+    moviebox: 'Moviebox',
+    castle: 'Castle',
+    showbox: 'Showbox',
+    streamwish: 'Streamwish',
+    filelions: 'Filelions',
+    doodstream: 'Doodstream',
+    vidcloud: 'Vidcloud',
+    upcloud: 'Upcloud',
+    mixdrop: 'Mixdrop',
+    superstream: 'Superstream',
+    vidsync: 'VidSync'
+  };
+
+  if (KNOWN_MAP[lower]) {
+    return KNOWN_MAP[lower];
+  }
+
+  if (clean.length > 1 && clean !== lower && clean !== clean.toUpperCase()) {
+    return clean;
+  }
+
+  return clean.charAt(0).toUpperCase() + clean.slice(1);
+}
+
+/**
+ * Quality sorting order: 2160p -> 1080p -> 720p -> 480p -> 360p -> Auto
+ */
+function qualityRank(q: string): number {
+  if (!q) return 999;
+  const clean = q.toLowerCase();
+  const match = clean.match(/(\d+)/);
+  if (match) {
+    return -parseInt(match[1], 10);
+  }
+  if (clean.includes('auto')) return 100;
+  return 200;
+}
+
 /**
  * Fetches streams directly from vidsync.pro API with proper headers
  */
@@ -259,22 +324,17 @@ export async function fetchVidsyncCoreStreams(
 }
 
 /**
- * Organizes raw vidsync sources into language hierarchy:
- * 1. English
- * 2. Hindi
- * 3. Japanese, Spanish, etc.
+ * Organizes raw vidsync sources into:
+ * Language Hierarchy (English, Hindi, etc.) -> Provider Name (VidSrc, Moviebox, etc.) -> Stream items (qualities)
  *
- * Each item contains only:
- * - url (direct URL or relay/proxy URL if not present)
- * - proxy_url (with https://vidsync.pro base)
- * - quality
- * No extra properties.
+ * Compiles all items from the same provider under the same language into a single provider entry,
+ * ordering qualities (1080p -> 720p -> 480p -> 360p) and removing duplicates.
  */
 export function organizeStreamsByLanguage(
   rawSources: any[],
   defaultLanguage: string = 'English'
-): Record<string, FormattedStreamItem[]> {
-  const tempMap: Record<string, FormattedStreamItem[]> = {};
+): LanguageProviderStreams {
+  const tempMap: Record<string, Record<string, FormattedStreamItem[]>> = {};
 
   for (const s of rawSources) {
     let playUrl = s.url || s.rawUrl || s.relayUrl || s.relay || '';
@@ -301,6 +361,8 @@ export function organizeStreamsByLanguage(
       quality: s.quality || 'Auto'
     };
 
+    const providerName = extractProviderName(s.provider, s);
+
     // Detect languages for this stream
     const langs = new Set<string>();
     if (Array.isArray(s.audioTracks) && s.audioTracks.length > 0) {
@@ -323,29 +385,50 @@ export function organizeStreamsByLanguage(
 
     for (const lang of langs) {
       if (!tempMap[lang]) {
-        tempMap[lang] = [];
+        tempMap[lang] = {};
       }
-      tempMap[lang].push(item);
+      if (!tempMap[lang][providerName]) {
+        tempMap[lang][providerName] = [];
+      }
+
+      // Compile entries for the same provider: keep distinct qualities (e.g. 1080p, 720p, 480p, 360p)
+      const existing = tempMap[lang][providerName];
+      const hasQuality = existing.some(ex => ex.quality === item.quality);
+      if (!hasQuality) {
+        existing.push(item);
+      }
     }
   }
 
   // Construct dictionary ordered by language hierarchy
-  const orderedResult: Record<string, FormattedStreamItem[]> = {};
+  const orderedResult: LanguageProviderStreams = {};
 
   // First priority languages (English, Hindi, etc.)
   for (const lang of PRIORITY_LANGUAGES) {
-    if (tempMap[lang] && tempMap[lang].length > 0) {
-      orderedResult[lang] = tempMap[lang];
+    if (tempMap[lang] && Object.keys(tempMap[lang]).length > 0) {
+      orderedResult[lang] = {};
+      const sortedProviders = Object.keys(tempMap[lang]).sort((a, b) => a.localeCompare(b));
+      for (const prov of sortedProviders) {
+        orderedResult[lang][prov] = tempMap[lang][prov].sort(
+          (a, b) => qualityRank(a.quality) - qualityRank(b.quality)
+        );
+      }
     }
   }
 
   // Any remaining languages alphabetically
   const remainingKeys = Object.keys(tempMap)
-    .filter(k => !orderedResult[k] && tempMap[k].length > 0)
+    .filter(k => !orderedResult[k] && Object.keys(tempMap[k]).length > 0)
     .sort((a, b) => a.localeCompare(b));
 
   for (const lang of remainingKeys) {
-    orderedResult[lang] = tempMap[lang];
+    orderedResult[lang] = {};
+    const sortedProviders = Object.keys(tempMap[lang]).sort((a, b) => a.localeCompare(b));
+    for (const prov of sortedProviders) {
+      orderedResult[lang][prov] = tempMap[lang][prov].sort(
+        (a, b) => qualityRank(a.quality) - qualityRank(b.quality)
+      );
+    }
   }
 
   return orderedResult;
@@ -446,7 +529,8 @@ vidsyncRouter.get(
         episode,
         ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || episode } : {}),
         source: organized,
-        sources: organized
+        sources: organized,
+        providers: organized
       };
 
       return res.json(responsePayload);
@@ -548,7 +632,8 @@ vidsyncRouter.get(
         episode: eNum,
         ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || eNum } : {}),
         source: organized,
-        sources: organized
+        sources: organized,
+        providers: organized
       };
 
       return res.json(responsePayload);
@@ -618,7 +703,8 @@ vidsyncRouter.get(
         tmdb_id: tmdbId,
         ...(anilistId ? { anilist_id: anilistId } : {}),
         source: organized,
-        sources: organized
+        sources: organized,
+        providers: organized
       };
 
       return res.json(responsePayload);

@@ -53,14 +53,14 @@ async function startServer() {
       },
       "/stream/tv/{tmdbId}/{absoluteEpisode}": {
         get: {
-          summary: "Vidsync TV & Anime Stream Resolver (grouped by language hierarchy: English, Hindi, etc.)",
+          summary: "Vidsync TV & Anime Stream Resolver (grouped by Language -> Provider -> Qualities)",
           parameters: [
             { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Show ID" },
             { name: "absoluteEpisode", in: "path", required: true, schema: { type: "integer" }, description: "Absolute episode number" }
           ],
           responses: {
             200: {
-              description: "Stream sources grouped by language hierarchy (English, Hindi, etc.)",
+              description: "Stream sources grouped by Language hierarchy and Provider with sorted qualities",
               content: {
                 "application/json": {
                   example: {
@@ -70,20 +70,36 @@ async function startServer() {
                     season: 1,
                     episode: 1,
                     sources: {
-                      English: [
-                        {
-                          url: "https://.../master.m3u8",
-                          proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
-                          quality: "480p"
-                        }
-                      ],
-                      Hindi: [
-                        {
-                          url: "https://.../index.m3u8",
-                          proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
-                          quality: "1080p"
-                        }
-                      ]
+                      English: {
+                        VidSrc: [
+                          {
+                            url: "https://.../master.m3u8",
+                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            quality: "480p"
+                          }
+                        ],
+                        Castle: [
+                          {
+                            url: "https://.../master.m3u8",
+                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            quality: "720p"
+                          },
+                          {
+                            url: "https://.../master.m3u8",
+                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            quality: "480p"
+                          }
+                        ]
+                      },
+                      Hindi: {
+                        VidZee: [
+                          {
+                            url: "https://.../index.m3u8",
+                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            quality: "1080p"
+                          }
+                        ]
+                      }
                     }
                   }
                 }
@@ -95,13 +111,13 @@ async function startServer() {
       },
       "/stream/movie/{tmdbId}": {
         get: {
-          summary: "Vidsync Movie Stream Resolver (grouped by language hierarchy: English, Hindi, etc.)",
+          summary: "Vidsync Movie Stream Resolver (grouped by Language -> Provider -> Qualities)",
           parameters: [
             { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Movie ID" }
           ],
           responses: {
             200: {
-              description: "Movie stream sources grouped by language hierarchy",
+              description: "Movie stream sources grouped by Language and Provider with sorted qualities",
               content: {
                 "application/json": {
                   example: {
@@ -109,13 +125,15 @@ async function startServer() {
                     type: "movie",
                     tmdb_id: "550",
                     sources: {
-                      English: [
-                        {
-                          url: "https://.../master.m3u8",
-                          proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
-                          quality: "360p"
-                        }
-                      ]
+                      Hindi: {
+                        VidZee: [
+                          {
+                            url: "https://.../master.m3u8",
+                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            quality: "1080p"
+                          }
+                        ]
+                      }
                     }
                   }
                 }
