@@ -151,7 +151,40 @@ async function startServer() {
             { name: "absoluteEpisode", in: "path", required: true, schema: { type: "integer" }, description: "Absolute episode number" }
           ],
           responses: {
-            200: { description: "Subtitles grouped by language" }
+            200: {
+              description: "Subtitles grouped by Language with Track 1, Track 2 numbering",
+              content: {
+                "application/json": {
+                  example: {
+                    success: true,
+                    provider: "Stremio OpenSubtitles v3",
+                    tmdb_id: "1396",
+                    imdb_id: "tt0903747",
+                    absolute_episode: 1,
+                    season: 1,
+                    episode: 1,
+                    subtitles: {
+                      "Language: English": {
+                        "Track 1": {
+                          "url": "https://...",
+                          "format": "vtt"
+                        },
+                        "Track 2": {
+                          "url": "https://...",
+                          "format": "srt"
+                        }
+                      },
+                      "Language: Hindi": {
+                        "Track 1": {
+                          "url": "https://...",
+                          "format": "vtt"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -162,7 +195,31 @@ async function startServer() {
             { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Movie ID" }
           ],
           responses: {
-            200: { description: "Subtitles grouped by language" }
+            200: {
+              description: "Subtitles grouped by Language with Track 1, Track 2 numbering",
+              content: {
+                "application/json": {
+                  example: {
+                    success: true,
+                    provider: "Stremio OpenSubtitles v3",
+                    tmdb_id: "550",
+                    imdb_id: "tt0137523",
+                    subtitles: {
+                      "Language: English": {
+                        "Track 1": {
+                          "url": "https://...",
+                          "format": "vtt"
+                        },
+                        "Track 2": {
+                          "url": "https://...",
+                          "format": "srt"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

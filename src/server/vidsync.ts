@@ -69,7 +69,20 @@ const ISO_LANG_MAP: Record<string, string> = {
   pan: 'Punjabi', pa: 'Punjabi',
   guj: 'Gujarati', gu: 'Gujarati',
   urd: 'Urdu', ur: 'Urdu',
-  fil: 'Filipino', tl: 'Filipino'
+  fil: 'Filipino', tl: 'Filipino',
+  bul: 'Bulgarian', bg: 'Bulgarian',
+  cze: 'Czech', ces: 'Czech', cs: 'Czech',
+  est: 'Estonian', et: 'Estonian',
+  hrv: 'Croatian', hr: 'Croatian',
+  hun: 'Hungarian', hu: 'Hungarian',
+  mac: 'Macedonian', mkd: 'Macedonian', mk: 'Macedonian',
+  per: 'Persian', fas: 'Persian', fa: 'Persian',
+  ron: 'Romanian', rum: 'Romanian', ro: 'Romanian',
+  slv: 'Slovenian', sl: 'Slovenian',
+  srp: 'Serbian', sr: 'Serbian',
+  ice: 'Icelandic', isl: 'Icelandic', is: 'Icelandic',
+  slk: 'Slovak', sk: 'Slovak',
+  ukr: 'Ukrainian', uk: 'Ukrainian'
 };
 
 /**
@@ -814,31 +827,48 @@ export async function retrieveOpenSubtitles(imdbId: string, isTv: boolean, seaso
   const data = await res.json();
   const rawSubtitles = Array.isArray(data.subtitles) ? data.subtitles : [];
 
-  const grouped: Record<string, Array<{ url: string; format: 'vtt' | 'srt' }>> = {};
+  const tempMap: Record<string, Record<string, { url: string; format: 'vtt' | 'srt' }>> = {};
 
   for (const item of rawSubtitles) {
     if (!item.url || typeof item.url !== 'string') continue;
     const langCode = item.lang || 'en';
-    const langName = getFullLanguageName(langCode);
+    const langName = normalizeLanguageName(langCode);
+    const langKey = `Language: ${langName}`;
 
-    if (!grouped[langName]) {
-      grouped[langName] = [];
+    if (!tempMap[langKey]) {
+      tempMap[langKey] = {};
     }
 
+    const trackNumber = Object.keys(tempMap[langKey]).length + 1;
+    const trackKey = `Track ${trackNumber}`;
     const format: 'vtt' | 'srt' = item.url.toLowerCase().endsWith('.vtt') ? 'vtt' : 'srt';
-    grouped[langName].push({
+
+    tempMap[langKey][trackKey] = {
       url: item.url,
       format
-    });
+    };
   }
 
-  const sortedKeys = Object.keys(grouped).sort((a, b) => a.localeCompare(b));
-  const sortedGroupedSubtitles: Record<string, Array<{ url: string; format: 'vtt' | 'srt' }>> = {};
-  for (const k of sortedKeys) {
-    sortedGroupedSubtitles[k] = grouped[k];
+  const orderedResult: Record<string, Record<string, { url: string; format: 'vtt' | 'srt' }>> = {};
+
+  // First priority languages (Hindi, English, etc.)
+  for (const lang of PRIORITY_LANGUAGES) {
+    const langKey = `Language: ${lang}`;
+    if (tempMap[langKey] && Object.keys(tempMap[langKey]).length > 0) {
+      orderedResult[langKey] = tempMap[langKey];
+    }
   }
 
-  return sortedGroupedSubtitles;
+  // Any remaining languages alphabetically
+  const remainingKeys = Object.keys(tempMap)
+    .filter(k => !orderedResult[k] && Object.keys(tempMap[k]).length > 0)
+    .sort((a, b) => a.localeCompare(b));
+
+  for (const langKey of remainingKeys) {
+    orderedResult[langKey] = tempMap[langKey];
+  }
+
+  return orderedResult;
 }
 
 // Subtitles - TV Show: GET /subtitles/tv/:tmdbId/:absoluteEpisode
