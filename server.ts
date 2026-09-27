@@ -70,15 +70,15 @@ async function startServer() {
                     season: 1,
                     episode: 1,
                     sources: {
-                      English: {
-                        VidSrc: [
+                      "Audio: English": {
+                        "Provider: VidSrc": [
                           {
                             url: "https://.../master.m3u8",
                             proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
                             quality: "480p"
                           }
                         ],
-                        Castle: [
+                        "Provider: Castle": [
                           {
                             url: "https://.../master.m3u8",
                             proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
@@ -91,8 +91,8 @@ async function startServer() {
                           }
                         ]
                       },
-                      Hindi: {
-                        VidZee: [
+                      "Audio: Hindi": {
+                        "Provider: VidZee": [
                           {
                             url: "https://.../index.m3u8",
                             proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
@@ -100,6 +100,11 @@ async function startServer() {
                           }
                         ]
                       }
+                    },
+                    subtitles: {
+                      English: [
+                        { url: "https://...", format: "vtt" }
+                      ]
                     }
                   }
                 }
@@ -125,8 +130,8 @@ async function startServer() {
                     type: "movie",
                     tmdb_id: "550",
                     sources: {
-                      Hindi: {
-                        VidZee: [
+                      "Audio: Hindi": {
+                        "Provider: VidZee": [
                           {
                             url: "https://.../master.m3u8",
                             proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
@@ -134,6 +139,11 @@ async function startServer() {
                           }
                         ]
                       }
+                    },
+                    subtitles: {
+                      English: [
+                        { url: "https://...", format: "vtt" }
+                      ]
                     }
                   }
                 }

@@ -384,15 +384,18 @@ export function organizeStreamsByLanguage(
     }
 
     for (const lang of langs) {
-      if (!tempMap[lang]) {
-        tempMap[lang] = {};
+      const audioKey = `Audio: ${lang}`;
+      const providerKey = `Provider: ${providerName}`;
+
+      if (!tempMap[audioKey]) {
+        tempMap[audioKey] = {};
       }
-      if (!tempMap[lang][providerName]) {
-        tempMap[lang][providerName] = [];
+      if (!tempMap[audioKey][providerKey]) {
+        tempMap[audioKey][providerKey] = [];
       }
 
       // Compile entries for the same provider: keep distinct qualities (e.g. 1080p, 720p, 480p, 360p)
-      const existing = tempMap[lang][providerName];
+      const existing = tempMap[audioKey][providerKey];
       const hasQuality = existing.some(ex => ex.quality === item.quality);
       if (!hasQuality) {
         existing.push(item);
@@ -405,11 +408,12 @@ export function organizeStreamsByLanguage(
 
   // First priority languages (English, Hindi, etc.)
   for (const lang of PRIORITY_LANGUAGES) {
-    if (tempMap[lang] && Object.keys(tempMap[lang]).length > 0) {
-      orderedResult[lang] = {};
-      const sortedProviders = Object.keys(tempMap[lang]).sort((a, b) => a.localeCompare(b));
+    const audioKey = `Audio: ${lang}`;
+    if (tempMap[audioKey] && Object.keys(tempMap[audioKey]).length > 0) {
+      orderedResult[audioKey] = {};
+      const sortedProviders = Object.keys(tempMap[audioKey]).sort((a, b) => a.localeCompare(b));
       for (const prov of sortedProviders) {
-        orderedResult[lang][prov] = tempMap[lang][prov].sort(
+        orderedResult[audioKey][prov] = tempMap[audioKey][prov].sort(
           (a, b) => qualityRank(a.quality) - qualityRank(b.quality)
         );
       }
@@ -421,11 +425,11 @@ export function organizeStreamsByLanguage(
     .filter(k => !orderedResult[k] && Object.keys(tempMap[k]).length > 0)
     .sort((a, b) => a.localeCompare(b));
 
-  for (const lang of remainingKeys) {
-    orderedResult[lang] = {};
-    const sortedProviders = Object.keys(tempMap[lang]).sort((a, b) => a.localeCompare(b));
+  for (const audioKey of remainingKeys) {
+    orderedResult[audioKey] = {};
+    const sortedProviders = Object.keys(tempMap[audioKey]).sort((a, b) => a.localeCompare(b));
     for (const prov of sortedProviders) {
-      orderedResult[lang][prov] = tempMap[lang][prov].sort(
+      orderedResult[audioKey][prov] = tempMap[audioKey][prov].sort(
         (a, b) => qualityRank(a.quality) - qualityRank(b.quality)
       );
     }
@@ -521,6 +525,19 @@ vidsyncRouter.get(
 
       const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
 
+      let subtitlesData: Record<string, any> = {};
+      try {
+        const itMap = await resolveItMap(tmdbId, absEpNum).catch(() => null);
+        if (itMap?.imdb_id) {
+          subtitlesData = await retrieveOpenSubtitles(
+            itMap.imdb_id,
+            true,
+            itMap.imdb_season || season,
+            itMap.imdb_episode || episode
+          ).catch(() => ({}));
+        }
+      } catch {}
+
       const responsePayload: any = {
         success: true,
         type: streamType,
@@ -530,7 +547,8 @@ vidsyncRouter.get(
         ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || episode } : {}),
         source: organized,
         sources: organized,
-        providers: organized
+        providers: organized,
+        subtitles: subtitlesData
       };
 
       return res.json(responsePayload);
@@ -624,6 +642,15 @@ vidsyncRouter.get(
 
       const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
 
+      let subtitlesData: Record<string, any> = {};
+      try {
+        const ext = await fetchTmdb(`/tv/${tmdbId}/external_ids`).catch(() => null);
+        const imdbId = ext?.imdb_id || null;
+        if (imdbId) {
+          subtitlesData = await retrieveOpenSubtitles(imdbId, true, sNum, eNum).catch(() => ({}));
+        }
+      } catch {}
+
       const responsePayload: any = {
         success: true,
         type: streamType,
@@ -633,7 +660,8 @@ vidsyncRouter.get(
         ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || eNum } : {}),
         source: organized,
         sources: organized,
-        providers: organized
+        providers: organized,
+        subtitles: subtitlesData
       };
 
       return res.json(responsePayload);
@@ -697,6 +725,14 @@ vidsyncRouter.get(
 
       const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
 
+      let subtitlesData: Record<string, any> = {};
+      try {
+        const imdbId = await getMovieImdbId(tmdbId).catch(() => null);
+        if (imdbId) {
+          subtitlesData = await retrieveOpenSubtitles(imdbId, false).catch(() => ({}));
+        }
+      } catch {}
+
       const responsePayload: any = {
         success: true,
         type: streamType,
@@ -704,7 +740,8 @@ vidsyncRouter.get(
         ...(anilistId ? { anilist_id: anilistId } : {}),
         source: organized,
         sources: organized,
-        providers: organized
+        providers: organized,
+        subtitles: subtitlesData
       };
 
       return res.json(responsePayload);
