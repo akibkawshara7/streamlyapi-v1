@@ -70,6 +70,15 @@ async function startServer() {
                     season: 1,
                     episode: 1,
                     sources: {
+                      "Audio: Hindi": {
+                        "Provider: VidZee": [
+                          {
+                            url: "https://.../index.m3u8",
+                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            quality: "1080p"
+                          }
+                        ]
+                      },
                       "Audio: English": {
                         "Provider: VidSrc": [
                           {
@@ -90,21 +99,7 @@ async function startServer() {
                             quality: "480p"
                           }
                         ]
-                      },
-                      "Audio: Hindi": {
-                        "Provider: VidZee": [
-                          {
-                            url: "https://.../index.m3u8",
-                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
-                            quality: "1080p"
-                          }
-                        ]
                       }
-                    },
-                    subtitles: {
-                      English: [
-                        { url: "https://...", format: "vtt" }
-                      ]
                     }
                   }
                 }
@@ -139,11 +134,6 @@ async function startServer() {
                           }
                         ]
                       }
-                    },
-                    subtitles: {
-                      English: [
-                        { url: "https://...", format: "vtt" }
-                      ]
                     }
                   }
                 }

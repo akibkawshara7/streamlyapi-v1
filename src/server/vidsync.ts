@@ -64,19 +64,81 @@ const ISO_LANG_MAP: Record<string, string> = {
   tel: 'Telugu', te: 'Telugu',
   mal: 'Malayalam', ml: 'Malayalam',
   kan: 'Kannada', kn: 'Kannada',
+  ben: 'Bengali', bn: 'Bengali',
+  mar: 'Marathi', mr: 'Marathi',
+  pan: 'Punjabi', pa: 'Punjabi',
+  guj: 'Gujarati', gu: 'Gujarati',
+  urd: 'Urdu', ur: 'Urdu',
   fil: 'Filipino', tl: 'Filipino'
 };
 
+/**
+ * Strict language normalizer that cleans track labels down to canonical language names
+ * Consolidates all variations (e.g. "Hindi (Original)", "1. Hindi", "Hindi 5.1", "hi", "hin") into "Hindi"
+ */
+export function normalizeLanguageName(raw: string, defaultLanguage: string = 'English'): string {
+  if (!raw || typeof raw !== 'string') return defaultLanguage;
+  let clean = raw.trim();
+
+  // Strip leading numbering like "1. ", "01. ", "2 - ", etc.
+  clean = clean.replace(/^\d+[\.\-\s:]+/, '').trim();
+
+  // Strip bracketed descriptors like (Original), [Dubbed], (Clean Audio), [ORG], (5.1)
+  clean = clean.replace(/[\(\[\{].*?[\)\]\}]/g, '').trim();
+
+  const lower = clean.toLowerCase();
+
+  // Check direct ISO map
+  if (ISO_LANG_MAP[lower]) {
+    return ISO_LANG_MAP[lower];
+  }
+
+  // Keywords matching with word boundary / subword support
+  if (/hindi|\bhin\b|\bhi\b/i.test(lower)) return 'Hindi';
+  if (/english|\beng\b|\ben\b/i.test(lower)) return 'English';
+  if (/japanese|\bjap\b|\bjpn\b|\bja\b/i.test(lower)) return 'Japanese';
+  if (/tamil|\btam\b|\bta\b/i.test(lower)) return 'Tamil';
+  if (/telugu|\btel\b|\bte\b/i.test(lower)) return 'Telugu';
+  if (/bengali|bangla|\bben\b|\bbn\b/i.test(lower)) return 'Bengali';
+  if (/malayalam|\bmal\b|\bml\b/i.test(lower)) return 'Malayalam';
+  if (/kannada|\bkan\b|\bkn\b/i.test(lower)) return 'Kannada';
+  if (/marathi|\bmar\b|\bmr\b/i.test(lower)) return 'Marathi';
+  if (/punjabi|\bpan\b|\bpa\b/i.test(lower)) return 'Punjabi';
+  if (/gujarati|\bguj\b|\bgu\b/i.test(lower)) return 'Gujarati';
+  if (/urdu|\burd\b|\bur\b/i.test(lower)) return 'Urdu';
+  if (/spanish|espanol|\bspa\b|\bes\b/i.test(lower)) return 'Spanish';
+  if (/french|francais|\bfra\b|\bfre\b|\bfr\b/i.test(lower)) return 'French';
+  if (/german|deutsch|\bger\b|\bdeu\b|\bde\b/i.test(lower)) return 'German';
+  if (/italian|italiano|\bita\b|\bit\b/i.test(lower)) return 'Italian';
+  if (/portuguese|portugues|\bpor\b|\bpt\b/i.test(lower)) return 'Portuguese';
+  if (/russian|\brus\b|\bru\b/i.test(lower)) return 'Russian';
+  if (/korean|\bkor\b|\bko\b/i.test(lower)) return 'Korean';
+  if (/chinese|mandarin|cantonese|\bzho\b|\bchi\b|\bzh\b/i.test(lower)) return 'Chinese';
+  if (/arabic|\bara\b|\bar\b/i.test(lower)) return 'Arabic';
+  if (/turkish|\btur\b|\btr\b/i.test(lower)) return 'Turkish';
+  if (/indonesian|\bind\b|\bid\b/i.test(lower)) return 'Indonesian';
+  if (/thai|\btha\b|\bth\b/i.test(lower)) return 'Thai';
+  if (/vietnamese|\bvie\b|\bvi\b/i.test(lower)) return 'Vietnamese';
+  if (/filipino|tagalog|\bfil\b|\btl\b/i.test(lower)) return 'Filipino';
+  if (/polish|\bpol\b|\bpl\b/i.test(lower)) return 'Polish';
+  if (/dutch|\bnld\b|\bdut\b|\bnl\b/i.test(lower)) return 'Dutch';
+
+  // Generic original/native label fallback to default language
+  if (/\b(original|native)\b/i.test(lower)) {
+    return defaultLanguage;
+  }
+
+  // Strip remaining audio-related words
+  const stripped = clean.replace(/\b(original|native|dubbed|dub|clean audio|audio|multi|org|5\.1|7\.1|aac|ac3)\b/gi, '').trim();
+  if (stripped.length > 2) {
+    return stripped.charAt(0).toUpperCase() + stripped.slice(1).toLowerCase();
+  }
+
+  return defaultLanguage;
+}
+
 export function getFullLanguageName(codeOrName: string): string {
-  if (!codeOrName || typeof codeOrName !== 'string') return 'English';
-  const clean = codeOrName.trim().toLowerCase();
-  if (ISO_LANG_MAP[clean]) {
-    return ISO_LANG_MAP[clean];
-  }
-  if (codeOrName.length > 3) {
-    return codeOrName.charAt(0).toUpperCase() + codeOrName.slice(1);
-  }
-  return clean.toUpperCase();
+  return normalizeLanguageName(codeOrName);
 }
 
 /**
@@ -174,21 +236,25 @@ export async function getMovieImdbId(tmdbId: string): Promise<string | null> {
 
 /**
  * Priority order for languages:
- * English first, then Hindi, then other popular global languages in descending order
+ * Hindi and English first, followed by Japanese, regional and international languages
  */
 const PRIORITY_LANGUAGES = [
-  'English',
   'Hindi',
+  'English',
   'Japanese',
-  'Spanish',
-  'French',
-  'German',
-  'Portuguese',
-  'Portuguese (Brazil)',
   'Tamil',
   'Telugu',
   'Malayalam',
   'Kannada',
+  'Bengali',
+  'Marathi',
+  'Punjabi',
+  'Gujarati',
+  'Urdu',
+  'Spanish',
+  'French',
+  'German',
+  'Portuguese',
   'Russian',
   'Italian',
   'Korean',
@@ -198,7 +264,9 @@ const PRIORITY_LANGUAGES = [
   'Filipino',
   'Thai',
   'Vietnamese',
-  'Indonesian'
+  'Indonesian',
+  'Polish',
+  'Dutch'
 ];
 
 export interface FormattedStreamItem {
@@ -525,19 +593,6 @@ vidsyncRouter.get(
 
       const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
 
-      let subtitlesData: Record<string, any> = {};
-      try {
-        const itMap = await resolveItMap(tmdbId, absEpNum).catch(() => null);
-        if (itMap?.imdb_id) {
-          subtitlesData = await retrieveOpenSubtitles(
-            itMap.imdb_id,
-            true,
-            itMap.imdb_season || season,
-            itMap.imdb_episode || episode
-          ).catch(() => ({}));
-        }
-      } catch {}
-
       const responsePayload: any = {
         success: true,
         type: streamType,
@@ -547,8 +602,7 @@ vidsyncRouter.get(
         ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || episode } : {}),
         source: organized,
         sources: organized,
-        providers: organized,
-        subtitles: subtitlesData
+        providers: organized
       };
 
       return res.json(responsePayload);
@@ -642,15 +696,6 @@ vidsyncRouter.get(
 
       const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
 
-      let subtitlesData: Record<string, any> = {};
-      try {
-        const ext = await fetchTmdb(`/tv/${tmdbId}/external_ids`).catch(() => null);
-        const imdbId = ext?.imdb_id || null;
-        if (imdbId) {
-          subtitlesData = await retrieveOpenSubtitles(imdbId, true, sNum, eNum).catch(() => ({}));
-        }
-      } catch {}
-
       const responsePayload: any = {
         success: true,
         type: streamType,
@@ -660,8 +705,7 @@ vidsyncRouter.get(
         ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || eNum } : {}),
         source: organized,
         sources: organized,
-        providers: organized,
-        subtitles: subtitlesData
+        providers: organized
       };
 
       return res.json(responsePayload);
@@ -725,14 +769,6 @@ vidsyncRouter.get(
 
       const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
 
-      let subtitlesData: Record<string, any> = {};
-      try {
-        const imdbId = await getMovieImdbId(tmdbId).catch(() => null);
-        if (imdbId) {
-          subtitlesData = await retrieveOpenSubtitles(imdbId, false).catch(() => ({}));
-        }
-      } catch {}
-
       const responsePayload: any = {
         success: true,
         type: streamType,
@@ -740,8 +776,7 @@ vidsyncRouter.get(
         ...(anilistId ? { anilist_id: anilistId } : {}),
         source: organized,
         sources: organized,
-        providers: organized,
-        subtitles: subtitlesData
+        providers: organized
       };
 
       return res.json(responsePayload);
