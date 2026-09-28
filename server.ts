@@ -1,8 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 
-import { itMapRouter } from './src/server/mapper.js';
-import { vidsyncRouter, subtitlesRouter } from './src/server/vidsync.js';
+import { vidsyncRouter, subtitlesRouter, shortRouter, imdbRouter } from './src/server/vidsync.js';
 
 async function startServer() {
   const app = express();
@@ -17,50 +16,21 @@ async function startServer() {
     info: {
       title: "Apikume & Vidsync Streaming API",
       version: "3.0.0",
-      description: "High-performance streaming resolver API with ITMap (TMDB + IMDb + AniList Fribb Mapping), Vidsync Streams (Language Hierarchy: English, Hindi, etc.), and OpenSubtitles."
+      description: "High-performance streaming resolver API with direct TMDB Season/Episode Streams, Short Redirect URLs (/s/:shortId), and OpenSubtitles."
     },
     servers: [{ url: "/" }],
     paths: {
-      "/map/{tmdb}/{absep}": {
+      "/stream/tv/{tmdbId}/{season}/{episode}": {
         get: {
-          summary: "ITMap: Map TMDB ID & absolute episode to TMDB Season/Episode, IMDb, and AniList ID",
-          parameters: [
-            { name: "tmdb", in: "path", required: true, schema: { type: "string" }, description: "TMDB TV Show ID" },
-            { name: "absep", in: "path", required: true, schema: { type: "integer" }, description: "Absolute episode number (default: 1)" }
-          ],
-          responses: {
-            200: {
-              description: "Complete mapping details including TMDB season/ep, IMDb ID & season/ep, and AniList ID & ep (if anime)",
-              content: {
-                "application/json": {
-                  example: {
-                    tmdb_id: "1429",
-                    season: 2,
-                    episode: 1,
-                    imdb_id: "tt2560140",
-                    imdb_season: 2,
-                    imdb_episode: 1,
-                    anilist_id: 20958,
-                    anilist_episode: 1
-                  }
-                }
-              }
-            },
-            400: { description: "Invalid parameters" },
-            502: { description: "Upstream mapping resolution failure" }
-          }
-        }
-      },
-      "/stream/tv/{tmdbId}/{absoluteEpisode}": {
-        get: {
-          summary: "Vidsync TV & Anime Stream Resolver (grouped by Language -> Provider -> Qualities)",
+          summary: "Vidsync TV Stream Resolver (grouped by Audio Language -> Provider -> Qualities)",
           parameters: [
             { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Show ID" },
-            { name: "absoluteEpisode", in: "path", required: true, schema: { type: "integer" }, description: "Absolute episode number" }
+            { name: "season", in: "path", required: true, schema: { type: "integer" }, description: "TMDB Season number" },
+            { name: "episode", in: "path", required: true, schema: { type: "integer" }, description: "TMDB Episode number" }
           ],
           responses: {
             200: {
-              description: "Stream sources grouped by Language hierarchy and Provider with sorted qualities",
+              description: "Stream sources grouped by Audio Language hierarchy and Provider with short redirect URLs",
               content: {
                 "application/json": {
                   example: {
@@ -69,12 +39,13 @@ async function startServer() {
                     tmdb_id: "1396",
                     season: 1,
                     episode: 1,
+                    tmdb_season: 1,
+                    tmdb_episode: 1,
                     sources: {
                       "Audio: Hindi": {
                         "Provider: VidZee": [
                           {
-                            url: "https://.../index.m3u8",
-                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            url: "http://localhost:3000/s/aB3x9K",
                             quality: "1080p"
                           }
                         ]
@@ -82,20 +53,7 @@ async function startServer() {
                       "Audio: English": {
                         "Provider: VidSrc": [
                           {
-                            url: "https://.../master.m3u8",
-                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
-                            quality: "480p"
-                          }
-                        ],
-                        "Provider: Castle": [
-                          {
-                            url: "https://.../master.m3u8",
-                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
-                            quality: "720p"
-                          },
-                          {
-                            url: "https://.../master.m3u8",
-                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            url: "http://localhost:3000/s/xP9k2L",
                             quality: "480p"
                           }
                         ]
@@ -111,13 +69,13 @@ async function startServer() {
       },
       "/stream/movie/{tmdbId}": {
         get: {
-          summary: "Vidsync Movie Stream Resolver (grouped by Language -> Provider -> Qualities)",
+          summary: "Vidsync Movie Stream Resolver (grouped by Audio Language -> Provider -> Qualities)",
           parameters: [
             { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Movie ID" }
           ],
           responses: {
             200: {
-              description: "Movie stream sources grouped by Language and Provider with sorted qualities",
+              description: "Movie stream sources grouped by Audio Language and Provider with short redirect URLs",
               content: {
                 "application/json": {
                   example: {
@@ -128,8 +86,7 @@ async function startServer() {
                       "Audio: Hindi": {
                         "Provider: VidZee": [
                           {
-                            url: "https://.../master.m3u8",
-                            proxy_url: "https://vidsync.pro/api/core/proxy?data=...",
+                            url: "http://localhost:3000/s/zT1k8V",
                             quality: "1080p"
                           }
                         ]
@@ -143,82 +100,140 @@ async function startServer() {
           }
         }
       },
-      "/subtitles/tv/{tmdbId}/{absoluteEpisode}": {
+      "/subtitles/tv/{tmdbId}/{season}/{episode}": {
         get: {
-          summary: "OpenSubtitles v3 Subtitles for TV Show (fetches IMDb ID, season, ep)",
+          summary: "Vidsync Subtitles for TV Show",
           parameters: [
-            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB ID" },
-            { name: "absoluteEpisode", in: "path", required: true, schema: { type: "integer" }, description: "Absolute episode number" }
+            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Show ID" },
+            { name: "season", in: "path", required: true, schema: { type: "integer" }, description: "Season number" },
+            { name: "episode", in: "path", required: true, schema: { type: "integer" }, description: "Episode number" }
           ],
           responses: {
             200: {
-              description: "Subtitles grouped by Language with Track 1, Track 2 numbering",
-              content: {
-                "application/json": {
-                  example: {
-                    success: true,
-                    provider: "Stremio OpenSubtitles v3",
-                    tmdb_id: "1396",
-                    imdb_id: "tt0903747",
-                    absolute_episode: 1,
-                    season: 1,
-                    episode: 1,
-                    subtitles: {
-                      "Language: English": {
-                        "Track 1": {
-                          "url": "https://...",
-                          "format": "vtt"
-                        },
-                        "Track 2": {
-                          "url": "https://...",
-                          "format": "srt"
-                        }
-                      },
-                      "Language: Hindi": {
-                        "Track 1": {
-                          "url": "https://...",
-                          "format": "vtt"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
+              description: "Complete list of subtitles from Vidsync with identity, languages, and tracks"
             }
           }
         }
       },
       "/subtitles/movie/{tmdbId}": {
         get: {
-          summary: "OpenSubtitles v3 Subtitles for Movie (fetches IMDb ID)",
+          summary: "Vidsync Subtitles for Movie",
           parameters: [
             { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Movie ID" }
           ],
           responses: {
             200: {
-              description: "Subtitles grouped by Language with Track 1, Track 2 numbering",
-              content: {
-                "application/json": {
-                  example: {
-                    success: true,
-                    provider: "Stremio OpenSubtitles v3",
-                    tmdb_id: "550",
-                    imdb_id: "tt0137523",
-                    subtitles: {
-                      "Language: English": {
-                        "Track 1": {
-                          "url": "https://...",
-                          "format": "vtt"
-                        },
-                        "Track 2": {
-                          "url": "https://...",
-                          "format": "srt"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
+              description: "Complete list of subtitles from Vidsync with identity, languages, and tracks"
+            }
+          }
+        }
+      },
+      "/subtitles/tmdb/tv/{tmdbId}": {
+        get: {
+          summary: "Exact Vidsync Mirror: Subtitles for TV Show",
+          parameters: [
+            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Show ID" },
+            { name: "season", in: "query", required: false, schema: { type: "integer", default: 1 }, description: "Season number" },
+            { name: "episode", in: "query", required: false, schema: { type: "integer", default: 1 }, description: "Episode number" }
+          ],
+          responses: {
+            200: {
+              description: "Raw Vidsync format with identity, languages, and subtitles list"
+            }
+          }
+        }
+      },
+      "/subtitles/tmdb/movie/{tmdbId}": {
+        get: {
+          summary: "Exact Vidsync Mirror: Subtitles for Movie",
+          parameters: [
+            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Movie ID" }
+          ],
+          responses: {
+            200: {
+              description: "Raw Vidsync format with identity, languages, and subtitles list"
+            }
+          }
+        }
+      },
+      "/subtitles/file": {
+        get: {
+          summary: "Proxied Subtitle File Streaming (VTT / SRT)",
+          parameters: [
+            { name: "url", in: "query", required: true, schema: { type: "string" }, description: "Target subtitle file URL" }
+          ],
+          responses: {
+            200: {
+              description: "Streams the WebVTT / SRT file with CORS enabled"
+            }
+          }
+        }
+      },
+      "/s/{shortId}": {
+        get: {
+          summary: "Short Redirect URL: Redirects to actual stream or proxy link",
+          parameters: [
+            { name: "shortId", in: "path", required: true, schema: { type: "string" }, description: "7-character short link code" }
+          ],
+          responses: {
+            302: { description: "Redirect to original target URL" },
+            404: { description: "Short link not found or expired" }
+          }
+        }
+      },
+      "/imdb/episodes": {
+        get: {
+          summary: "IMDb Series & Season Episodes Finder",
+          parameters: [
+            { name: "id", in: "query", required: true, schema: { type: "string" }, description: "IMDb ID (tt...) or TMDB ID" },
+            { name: "season", in: "query", required: false, schema: { type: "integer" }, description: "Season number (optional)" }
+          ],
+          responses: {
+            200: {
+              description: "Full IMDb metadata along with episodes list, scraped with resilient fallbacks"
+            }
+          }
+        }
+      },
+      "/imdb/{tmdbId}": {
+        get: {
+          summary: "Map entire TMDB TV Show to IMDb episodes",
+          parameters: [
+            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Show ID or IMDb ID" },
+            { name: "season", in: "query", required: false, schema: { type: "integer" }, description: "Filter specific season (optional)" }
+          ],
+          responses: {
+            200: {
+              description: "Array of mapped episodes showing title, released date, and match correctness"
+            }
+          }
+        }
+      },
+      "/imdb/{tmdbId}/{season}/{ep}": {
+        get: {
+          summary: "Match individual episode ignoring absolute numbering discrepancies",
+          parameters: [
+            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB ID or IMDb ID" },
+            { name: "season", in: "path", required: true, schema: { type: "integer" }, description: "TMDB Season number" },
+            { name: "ep", in: "path", required: true, schema: { type: "integer" }, description: "Episode index count (e.g. 18 for the 18th episode)" }
+          ],
+          responses: {
+            200: {
+              description: "Complete mapped episode object with matching success status"
+            }
+          }
+        }
+      },
+      "/imdb/id/{imdbId}": {
+        get: {
+          summary: "Fetch direct raw IMDb episodes (using unblocked high-performance dataset dumps)",
+          parameters: [
+            { name: "imdbId", in: "path", required: true, schema: { type: "string" }, description: "IMDb Series ID starting with 'tt'" },
+            { name: "season", in: "query", required: false, schema: { type: "integer" }, description: "Filter specific season (optional)" }
+          ],
+          responses: {
+            200: {
+              description: "Direct array of unmapped IMDb episodes containing original numbering"
             }
           }
         }
@@ -272,11 +287,10 @@ async function startServer() {
     res.send(swaggerHtml);
   });
 
-  // ITMap (with integrated Fribb AniList detection): /map/:tmdb/:absep and /api/map/:tmdb/:absep
-  app.use('/map', itMapRouter);
-  app.use('/api/map', itMapRouter);
+  // Short URL Redirector: /s/:shortId
+  app.use('/s', shortRouter);
 
-  // Vidsync Stream: /api/stream/tv or movie, /stream/tv or movie (and /api/vidsync alias)
+  // Vidsync Stream: /api/stream/tv or movie, /stream/tv or movie
   app.use('/api/stream', vidsyncRouter);
   app.use('/stream', vidsyncRouter);
   app.use('/api/vidsync', vidsyncRouter);
@@ -285,6 +299,10 @@ async function startServer() {
   // Subtitles: /subtitles and /api/subtitles
   app.use('/subtitles', subtitlesRouter);
   app.use('/api/subtitles', subtitlesRouter);
+
+  // IMDb Episodes: /imdb and /api/imdb
+  app.use('/imdb', imdbRouter);
+  app.use('/api/imdb', imdbRouter);
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);

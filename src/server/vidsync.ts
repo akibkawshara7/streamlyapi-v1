@@ -1,10 +1,11 @@
 import express, { Request, Response } from 'express';
-import { resolveItMap } from './mapper.js';
-import { detectAniListFromFribb } from './fribb.js';
+import * as cheerio from 'cheerio';
 
 export const vidsyncRouter = express.Router();
 export const subtitlesRouter = express.Router();
 export const embedRouter = express.Router();
+export const shortRouter = express.Router();
+export const imdbRouter = express.Router();
 
 // Strictly no cache middleware for streams
 const strictlyNoCacheMiddleware = (req: Request, res: Response, next: Function) => {
@@ -18,6 +19,7 @@ const strictlyNoCacheMiddleware = (req: Request, res: Response, next: Function) 
 vidsyncRouter.use(strictlyNoCacheMiddleware);
 subtitlesRouter.use(strictlyNoCacheMiddleware);
 embedRouter.use(strictlyNoCacheMiddleware);
+imdbRouter.use(strictlyNoCacheMiddleware);
 
 // Public TMDB API keys with fallback rotation
 const TMDB_KEYS = [
@@ -29,9 +31,65 @@ const TMDB_KEYS = [
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-const tmdbMovieCache = new Map<string, { timestamp: number; imdbId: string | null }>();
-const tmdbTvSeasonCache = new Map<string, { timestamp: number; seasons: any[] }>();
+const tmdbMovieCache = new Map<string, { timestamp: number; data: any }>();
+const tmdbTvCache = new Map<string, { timestamp: number; data: any }>();
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Short URL maps for /s/:shortId redirector
+const shortUrlMap = new Map<string, string>();
+const urlToShortMap = new Map<string, string>();
+
+/**
+ * Encodes a long stream/proxy URL into a short link hosted on the website's base URL
+ * e.g. http://localhost:3000/s/aB3x9K
+ */
+export function shortenUrl(rawUrl: string, req?: Request): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+
+  let shortId = urlToShortMap.get(rawUrl);
+  if (!shortId) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let code = '';
+    for (let i = 0; i < 7; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    shortId = code;
+    shortUrlMap.set(shortId, rawUrl);
+    urlToShortMap.set(rawUrl, shortId);
+  }
+
+  let host = 'localhost:3000';
+  let protocol = 'http';
+  if (req) {
+    host = (req.get('x-forwarded-host') || req.get('host') || host).split(',')[0].trim();
+    protocol = (req.get('x-forwarded-proto') || req.protocol || 'http').split(',')[0].trim();
+  }
+
+  return `${protocol}://${host}/s/${shortId}`;
+}
+
+// Redirect router for /s/:shortId
+shortRouter.get('/:shortId', (req: Request, res: Response) => {
+  const { shortId } = req.params;
+  const targetUrl = shortUrlMap.get(shortId);
+
+  if (targetUrl) {
+    return res.redirect(302, targetUrl);
+  }
+
+  // Fallback: Check if shortId is a base64url encoded URL
+  try {
+    const decoded = Buffer.from(shortId, 'base64url').toString('utf-8');
+    if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+      return res.redirect(302, decoded);
+    }
+  } catch {}
+
+  return res.status(404).json({
+    success: false,
+    error: 'Short URL not found or expired.'
+  });
+});
 
 // ISO 639 code to English display name mapping
 const ISO_LANG_MAP: Record<string, string> = {
@@ -87,7 +145,6 @@ const ISO_LANG_MAP: Record<string, string> = {
 
 /**
  * Strict language normalizer that cleans track labels down to canonical language names
- * Consolidates all variations (e.g. "Hindi (Original)", "1. Hindi", "Hindi 5.1", "hi", "hin") into "Hindi"
  */
 export function normalizeLanguageName(raw: string, defaultLanguage: string = 'English'): string {
   if (!raw || typeof raw !== 'string') return defaultLanguage;
@@ -96,17 +153,15 @@ export function normalizeLanguageName(raw: string, defaultLanguage: string = 'En
   // Strip leading numbering like "1. ", "01. ", "2 - ", etc.
   clean = clean.replace(/^\d+[\.\-\s:]+/, '').trim();
 
-  // Strip bracketed descriptors like (Original), [Dubbed], (Clean Audio), [ORG], (5.1)
+  // Strip bracketed descriptors
   clean = clean.replace(/[\(\[\{].*?[\)\]\}]/g, '').trim();
 
   const lower = clean.toLowerCase();
 
-  // Check direct ISO map
   if (ISO_LANG_MAP[lower]) {
     return ISO_LANG_MAP[lower];
   }
 
-  // Keywords matching with word boundary / subword support
   if (/hindi|\bhin\b|\bhi\b/i.test(lower)) return 'Hindi';
   if (/english|\beng\b|\ben\b/i.test(lower)) return 'English';
   if (/japanese|\bjap\b|\bjpn\b|\bja\b/i.test(lower)) return 'Japanese';
@@ -136,12 +191,10 @@ export function normalizeLanguageName(raw: string, defaultLanguage: string = 'En
   if (/polish|\bpol\b|\bpl\b/i.test(lower)) return 'Polish';
   if (/dutch|\bnld\b|\bdut\b|\bnl\b/i.test(lower)) return 'Dutch';
 
-  // Generic original/native label fallback to default language
   if (/\b(original|native)\b/i.test(lower)) {
     return defaultLanguage;
   }
 
-  // Strip remaining audio-related words
   const stripped = clean.replace(/\b(original|native|dubbed|dub|clean audio|audio|multi|org|5\.1|7\.1|aac|ac3)\b/gi, '').trim();
   if (stripped.length > 2) {
     return stripped.charAt(0).toUpperCase() + stripped.slice(1).toLowerCase();
@@ -178,78 +231,7 @@ async function fetchTmdb(endpointPath: string): Promise<any> {
 }
 
 /**
- * Resolves TMDB TV season and episode from absolute episode without IMDb fetch
- */
-async function getTmdbTvSeasonAndEpisode(tmdbId: string, absoluteEpisode: number): Promise<{ season: number; episode: number }> {
-  let seasons: any[] = [];
-  const cached = tmdbTvSeasonCache.get(tmdbId);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    seasons = cached.seasons;
-  } else {
-    try {
-      const data = await fetchTmdb(`/tv/${tmdbId}`);
-      seasons = data.seasons || [];
-      tmdbTvSeasonCache.set(tmdbId, { timestamp: Date.now(), seasons });
-    } catch {
-      seasons = [];
-    }
-  }
-
-  const regularSeasons = seasons
-    .filter((s: any) => typeof s.season_number === 'number' && s.season_number > 0)
-    .sort((a: any, b: any) => a.season_number - b.season_number);
-
-  let remTmdb = absoluteEpisode;
-  let tmdbSeason = 1;
-  let tmdbEpisode = absoluteEpisode;
-  let tmdbMatched = false;
-
-  for (const s of regularSeasons) {
-    const epCount = s.episode_count || 0;
-    if (epCount <= 0) continue;
-    if (!tmdbMatched && remTmdb <= epCount) {
-      tmdbSeason = s.season_number;
-      tmdbEpisode = remTmdb;
-      tmdbMatched = true;
-      break;
-    }
-    remTmdb -= epCount;
-  }
-
-  if (!tmdbMatched && regularSeasons.length > 0) {
-    const lastSeason = regularSeasons[regularSeasons.length - 1];
-    tmdbSeason = lastSeason.season_number;
-    tmdbEpisode = remTmdb;
-  }
-
-  return { season: tmdbSeason, episode: tmdbEpisode };
-}
-
-/**
- * Resolves IMDb ID for a Movie via TMDB external_ids (used for Subtitles)
- */
-export async function getMovieImdbId(tmdbId: string): Promise<string | null> {
-  const cached = tmdbMovieCache.get(tmdbId);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return cached.imdbId;
-  }
-
-  try {
-    const extData = await fetchTmdb(`/movie/${tmdbId}/external_ids`);
-    const imdbId = extData.imdb_id || null;
-    tmdbMovieCache.set(tmdbId, {
-      timestamp: Date.now(),
-      imdbId
-    });
-    return imdbId;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Priority order for languages:
- * Hindi and English first, followed by Japanese, regional and international languages
+ * Priority order for languages
  */
 const PRIORITY_LANGUAGES = [
   'Hindi',
@@ -284,7 +266,6 @@ const PRIORITY_LANGUAGES = [
 
 export interface FormattedStreamItem {
   url: string;
-  proxy_url: string;
   quality: string;
 }
 
@@ -304,7 +285,7 @@ export function extractProviderName(rawProvider: any, sourceItem?: any): string 
   if (typeof val === 'string') {
     name = val.trim();
   } else if (typeof val === 'object') {
-    name = val.name || val.id || 'Default';
+    name = val.name || val.id || val.provider || val.server || 'Default';
   } else {
     name = String(val);
   }
@@ -344,40 +325,37 @@ export function extractProviderName(rawProvider: any, sourceItem?: any): string 
  */
 function qualityRank(q: string): number {
   if (!q) return 999;
-  const clean = q.toLowerCase();
-  const match = clean.match(/(\d+)/);
+  const match = q.match(/(\d+)p?/i);
   if (match) {
     return -parseInt(match[1], 10);
   }
-  if (clean.includes('auto')) return 100;
-  return 200;
+  if (/4k|uhd/i.test(q)) return -2160;
+  if (/auto/i.test(q)) return 1000;
+  return 500;
 }
 
 /**
- * Fetches streams directly from vidsync.pro API with proper headers
+ * Fetches core streams from vidsync.pro upstream
  */
 export async function fetchVidsyncCoreStreams(
-  type: 'tv' | 'anime' | 'movie',
-  params: {
-    id: string | number;
-    season?: number;
-    episode?: number;
-  }
+  type: 'tv' | 'movie' | 'anime',
+  params: { id: string | number; season?: number; episode?: number }
 ): Promise<any[]> {
-  const { id, season = 1, episode = 1 } = params;
-
-  let requestUrl = '';
-  if (type === 'tv') {
-    requestUrl = `https://vidsync.pro/api/core/streams?type=tv&id=${id}&episode=${episode}&season=${season}`;
-  } else if (type === 'anime') {
-    requestUrl = `https://vidsync.pro/api/core/streams?type=anime&id=${id}&episode=${episode}`;
-  } else {
-    requestUrl = `https://vidsync.pro/api/core/streams?type=movie&id=${id}`;
+  const query = new URLSearchParams();
+  query.set('type', type);
+  query.set('id', String(params.id));
+  if (params.season !== undefined) {
+    query.set('season', String(params.season));
   }
+  if (params.episode !== undefined) {
+    query.set('episode', String(params.episode));
+  }
+
+  const targetUrl = `https://vidsync.pro/api/core/streams?${query.toString()}`;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const res = await fetch(requestUrl, {
+      const res = await fetch(targetUrl, {
         headers: {
           'User-Agent': USER_AGENT,
           'Origin': 'https://vidsync.pro',
@@ -406,14 +384,12 @@ export async function fetchVidsyncCoreStreams(
 
 /**
  * Organizes raw vidsync sources into:
- * Language Hierarchy (English, Hindi, etc.) -> Provider Name (VidSrc, Moviebox, etc.) -> Stream items (qualities)
- *
- * Compiles all items from the same provider under the same language into a single provider entry,
- * ordering qualities (1080p -> 720p -> 480p -> 360p) and removing duplicates.
+ * Audio: <Language> -> Provider: <Provider> -> Stream items (shortened URLs)
  */
 export function organizeStreamsByLanguage(
   rawSources: any[],
-  defaultLanguage: string = 'English'
+  defaultLanguage: string = 'English',
+  req?: Request
 ): LanguageProviderStreams {
   const tempMap: Record<string, Record<string, FormattedStreamItem[]>> = {};
 
@@ -423,22 +399,8 @@ export function organizeStreamsByLanguage(
       playUrl = `https://vidsync.pro${playUrl}`;
     }
 
-    let proxyUrl = s.proxyUrl || s.proxy_url || '';
-    if (proxyUrl && proxyUrl.startsWith('/')) {
-      proxyUrl = `https://vidsync.pro${proxyUrl}`;
-    }
-
-    // Add relay/proxy URL if the direct URL is not present
-    if (!playUrl && proxyUrl) {
-      playUrl = proxyUrl;
-    }
-    if (!proxyUrl && playUrl && playUrl.includes('vidsync.pro')) {
-      proxyUrl = playUrl;
-    }
-
     const item: FormattedStreamItem = {
       url: playUrl,
-      proxy_url: proxyUrl,
       quality: s.quality || 'Auto'
     };
 
@@ -450,15 +412,15 @@ export function organizeStreamsByLanguage(
       for (const track of s.audioTracks) {
         const labelOrCode = track.label || track.language;
         if (labelOrCode) {
-          langs.add(getFullLanguageName(labelOrCode));
+          langs.add(normalizeLanguageName(labelOrCode, defaultLanguage));
         }
       }
     }
     if (s.edition?.audioLabel || s.edition?.audio) {
-      langs.add(getFullLanguageName(s.edition.audioLabel || s.edition.audio));
+      langs.add(normalizeLanguageName(s.edition.audioLabel || s.edition.audio, defaultLanguage));
     }
     if (s.language) {
-      langs.add(getFullLanguageName(s.language));
+      langs.add(normalizeLanguageName(s.language, defaultLanguage));
     }
     if (langs.size === 0) {
       langs.add(defaultLanguage);
@@ -475,7 +437,6 @@ export function organizeStreamsByLanguage(
         tempMap[audioKey][providerKey] = [];
       }
 
-      // Compile entries for the same provider: keep distinct qualities (e.g. 1080p, 720p, 480p, 360p)
       const existing = tempMap[audioKey][providerKey];
       const hasQuality = existing.some(ex => ex.quality === item.quality);
       if (!hasQuality) {
@@ -484,10 +445,8 @@ export function organizeStreamsByLanguage(
     }
   }
 
-  // Construct dictionary ordered by language hierarchy
   const orderedResult: LanguageProviderStreams = {};
 
-  // First priority languages (English, Hindi, etc.)
   for (const lang of PRIORITY_LANGUAGES) {
     const audioKey = `Audio: ${lang}`;
     if (tempMap[audioKey] && Object.keys(tempMap[audioKey]).length > 0) {
@@ -501,7 +460,6 @@ export function organizeStreamsByLanguage(
     }
   }
 
-  // Any remaining languages alphabetically
   const remainingKeys = Object.keys(tempMap)
     .filter(k => !orderedResult[k] && Object.keys(tempMap[k]).length > 0)
     .sort((a, b) => a.localeCompare(b));
@@ -520,123 +478,28 @@ export function organizeStreamsByLanguage(
 }
 
 // -------------------------------------------------------------
-// Route Controllers: Vidsync Streams (No IMDb fetch needed)
+// Route Controllers: Vidsync Streams (Direct TMDB Season & Episode)
 // -------------------------------------------------------------
 
-// 1. TV Stream: GET /stream/tv/:tmdbId/:absoluteEpisode (and aliases)
+// 1. TV Stream: GET /stream/tv/:tmdbId/:season/:episode (or /stream/tv/:tmdbId/:episode)
 vidsyncRouter.get(
-  ['/tv/:tmdbId/:absoluteEpisode', '/:tmdbId/:absoluteEpisode'],
-  async (req: Request, res: Response, next) => {
-    const { tmdbId, absoluteEpisode } = req.params;
-
-    if (tmdbId === 'movie' || tmdbId === 'anime') {
+  [
+    '/tv/:tmdbId/:season/:episode',
+    '/tv/:tmdbId/:episode',
+    '/:tmdbId/:season/:episode',
+    '/:tmdbId/:episode'
+  ],
+  async (req: Request, res: Response, next: express.NextFunction) => {
+    const { tmdbId } = req.params;
+    if (tmdbId === 'movie') {
       return next();
     }
+    let season = req.params.season;
+    let episode = req.params.episode;
 
-    if (!tmdbId || !/^\d+$/.test(tmdbId)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid or missing tmdbId. Must be numeric.'
-      });
-    }
-
-    const absEpNum = parseInt(absoluteEpisode, 10);
-    if (isNaN(absEpNum) || absEpNum < 1) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid absoluteEpisode. Must be a positive integer >= 1.'
-      });
-    }
-
-    try {
-      // 1. Direct TMDB Season and Episode calculation (no IMDb fetch)
-      const { season, episode } = await getTmdbTvSeasonAndEpisode(tmdbId, absEpNum);
-
-      // 2. Direct Fribb AniList check
-      let anilistId: number | null = null;
-      let anilistEp: number | null = null;
-      try {
-        const detected = await detectAniListFromFribb({
-          tmdbId,
-          absoluteEpisode: absEpNum,
-          tmdbSeason: season,
-          tmdbEpisode: episode
-        });
-        if (detected.anilist_id) {
-          anilistId = detected.anilist_id;
-          anilistEp = detected.anilist_episode || episode;
-        }
-      } catch {}
-
-      let rawSources: any[] = [];
-      let streamType: 'tv' | 'anime' = 'tv';
-
-      // If anime detected, fetch anime stream directly
-      if (anilistId) {
-        rawSources = await fetchVidsyncCoreStreams('anime', {
-          id: anilistId,
-          episode: anilistEp || episode
-        });
-        if (rawSources.length > 0) {
-          streamType = 'anime';
-        }
-      }
-
-      // If not anime or anime stream yielded no sources, fetch tv stream
-      if (rawSources.length === 0) {
-        rawSources = await fetchVidsyncCoreStreams('tv', {
-          id: tmdbId,
-          season,
-          episode
-        });
-        streamType = 'tv';
-      }
-
-      if (rawSources.length === 0) {
-        return res.status(404).json({
-          success: false,
-          type: streamType,
-          error: `No playable stream sources found for TMDB ${tmdbId} S${season}E${episode}.`,
-          tmdb_id: tmdbId,
-          season,
-          episode,
-          ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || episode } : {})
-        });
-      }
-
-      const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
-
-      const responsePayload: any = {
-        success: true,
-        type: streamType,
-        tmdb_id: tmdbId,
-        season,
-        episode,
-        ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || episode } : {}),
-        source: organized,
-        sources: organized,
-        providers: organized
-      };
-
-      return res.json(responsePayload);
-    } catch (err: any) {
-      return res.status(502).json({
-        success: false,
-        error: 'Failed to resolve TV streams from upstream Vidsync player.',
-        details: err.message || String(err)
-      });
-    }
-  }
-);
-
-// 1b. TV Stream with explicit season & episode: GET /stream/tv/:tmdbId/:season/:episode
-vidsyncRouter.get(
-  ['/tv/:tmdbId/:season/:episode', '/:tmdbId/:season/:episode'],
-  async (req: Request, res: Response, next) => {
-    const { tmdbId, season, episode } = req.params;
-
-    if (tmdbId === 'movie' || tmdbId === 'anime') {
-      return next();
+    if (!episode) {
+      episode = season;
+      season = '1';
     }
 
     if (!tmdbId || !/^\d+$/.test(tmdbId)) {
@@ -648,6 +511,7 @@ vidsyncRouter.get(
 
     const sNum = parseInt(season, 10);
     const eNum = parseInt(episode, 10);
+
     if (isNaN(sNum) || sNum < 1 || isNaN(eNum) || eNum < 1) {
       return res.status(400).json({
         success: false,
@@ -656,72 +520,39 @@ vidsyncRouter.get(
     }
 
     try {
-      // Check directly in Fribb for AniList match
-      let anilistId: number | null = null;
-      let anilistEp: number | null = null;
-
-      try {
-        const detected = await detectAniListFromFribb({
-          tmdbId,
-          absoluteEpisode: eNum,
-          tmdbSeason: sNum,
-          tmdbEpisode: eNum
-        });
-        if (detected.anilist_id) {
-          anilistId = detected.anilist_id;
-          anilistEp = detected.anilist_episode || eNum;
-        }
-      } catch {}
-
-      let rawSources: any[] = [];
-      let streamType: 'tv' | 'anime' = 'tv';
-
-      if (anilistId) {
-        rawSources = await fetchVidsyncCoreStreams('anime', {
-          id: anilistId,
-          episode: anilistEp || eNum
-        });
-        if (rawSources.length > 0) {
-          streamType = 'anime';
-        }
-      }
-
-      if (rawSources.length === 0) {
-        rawSources = await fetchVidsyncCoreStreams('tv', {
-          id: tmdbId,
-          season: sNum,
-          episode: eNum
-        });
-        streamType = 'tv';
-      }
+      const rawSources = await fetchVidsyncCoreStreams('tv', {
+        id: tmdbId,
+        season: sNum,
+        episode: eNum
+      });
 
       if (rawSources.length === 0) {
         return res.status(404).json({
           success: false,
-          type: streamType,
+          type: 'tv',
           error: `No playable stream sources found for TMDB ${tmdbId} S${sNum}E${eNum}.`,
           tmdb_id: tmdbId,
           season: sNum,
           episode: eNum,
-          ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || eNum } : {})
+          tmdb_season: sNum,
+          tmdb_episode: eNum
         });
       }
 
-      const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
+      const organized = organizeStreamsByLanguage(rawSources, 'English', req);
 
-      const responsePayload: any = {
+      return res.json({
         success: true,
-        type: streamType,
+        type: 'tv',
         tmdb_id: tmdbId,
         season: sNum,
         episode: eNum,
-        ...(anilistId ? { anilist_id: anilistId, anilist_episode: anilistEp || eNum } : {}),
+        tmdb_season: sNum,
+        tmdb_episode: eNum,
         source: organized,
         sources: organized,
         providers: organized
-      };
-
-      return res.json(responsePayload);
+      });
     } catch (err: any) {
       return res.status(502).json({
         success: false,
@@ -732,7 +563,7 @@ vidsyncRouter.get(
   }
 );
 
-// 2. Movie Stream: GET /stream/movie/:tmdbId (No IMDb fetch)
+// 2. Movie Stream: GET /stream/movie/:tmdbId
 vidsyncRouter.get(
   ['/movie/:tmdbId', '/:tmdbId'],
   async (req: Request, res: Response) => {
@@ -746,53 +577,27 @@ vidsyncRouter.get(
     }
 
     try {
-      // Check directly in Fribb if Anime movie detected
-      let anilistId: number | null = null;
-      try {
-        const detected = await detectAniListFromFribb({
-          tmdbId,
-          absoluteEpisode: 1
-        });
-        if (detected.anilist_id) {
-          anilistId = detected.anilist_id;
-        }
-      } catch {}
-
-      let rawSources: any[] = [];
-      let streamType: 'movie' | 'anime' = 'movie';
-
-      rawSources = await fetchVidsyncCoreStreams('movie', { id: tmdbId });
-
-      if (rawSources.length === 0 && anilistId) {
-        rawSources = await fetchVidsyncCoreStreams('anime', { id: anilistId, episode: 1 });
-        if (rawSources.length > 0) {
-          streamType = 'anime';
-        }
-      }
+      const rawSources = await fetchVidsyncCoreStreams('movie', { id: tmdbId });
 
       if (rawSources.length === 0) {
         return res.status(404).json({
           success: false,
-          type: streamType,
+          type: 'movie',
           error: `No playable stream sources found for Movie TMDB ${tmdbId}.`,
-          tmdb_id: tmdbId,
-          ...(anilistId ? { anilist_id: anilistId } : {})
+          tmdb_id: tmdbId
         });
       }
 
-      const organized = organizeStreamsByLanguage(rawSources, streamType === 'anime' ? 'Japanese' : 'English');
+      const organized = organizeStreamsByLanguage(rawSources, 'English', req);
 
-      const responsePayload: any = {
+      return res.json({
         success: true,
-        type: streamType,
+        type: 'movie',
         tmdb_id: tmdbId,
-        ...(anilistId ? { anilist_id: anilistId } : {}),
         source: organized,
         sources: organized,
         providers: organized
-      };
-
-      return res.json(responsePayload);
+      });
     } catch (err: any) {
       return res.status(502).json({
         success: false,
@@ -804,132 +609,177 @@ vidsyncRouter.get(
 );
 
 // -------------------------------------------------------------
-// Subtitles - OpenSubtitles v3 (Fetch IMDb ID, Season, and Episode here)
+// Subtitles - Vidsync (With TMDB API)
 // -------------------------------------------------------------
 
-export async function retrieveOpenSubtitles(imdbId: string, isTv: boolean, season?: number, episode?: number) {
+export async function retrieveVidsyncSubtitles(tmdbId: string, isTv: boolean, season?: number, episode?: number) {
   const subtitleUrl = isTv
-    ? `https://opensubtitles-v3.strem.io/subtitles/series/${imdbId}:${season}:${episode}.json`
-    : `https://opensubtitles-v3.strem.io/subtitles/movie/${imdbId}.json`;
+    ? `https://vidsync.pro/api/subtitles/tmdb/tv/${tmdbId}?season=${season || 1}&episode=${episode || 1}`
+    : `https://vidsync.pro/api/subtitles/tmdb/movie/${tmdbId}`;
 
   const res = await fetch(subtitleUrl, {
     headers: {
       'User-Agent': USER_AGENT,
-      'Accept': 'application/json'
+      'Origin': 'https://vidsync.pro',
+      'Referer': 'https://vidsync.pro/',
+      'Accept': 'application/json, text/plain, */*'
     },
-    signal: AbortSignal.timeout(12000)
+    signal: AbortSignal.timeout(15000)
   });
 
   if (!res.ok) {
-    throw new Error(`OpenSubtitles v3 returned HTTP ${res.status}: ${res.statusText}`);
+    throw new Error(`Vidsync Subtitles returned HTTP ${res.status}: ${res.statusText}`);
   }
 
   const data = await res.json();
-  const rawSubtitles = Array.isArray(data.subtitles) ? data.subtitles : [];
+  const list = Array.isArray(data?.subtitles)
+    ? data.subtitles
+    : Array.isArray(data)
+    ? data
+    : [];
 
-  const tempMap: Record<string, Record<string, { url: string; format: 'vtt' | 'srt' }>> = {};
-
-  for (const item of rawSubtitles) {
-    if (!item.url || typeof item.url !== 'string') continue;
-    const langCode = item.lang || 'en';
-    const langName = normalizeLanguageName(langCode);
-    const langKey = `Language: ${langName}`;
-
-    if (!tempMap[langKey]) {
-      tempMap[langKey] = {};
+  const formattedSubtitles = list.map((item: any) => {
+    let playUrl = item.url || '';
+    if (playUrl && playUrl.startsWith('/')) {
+      playUrl = `https://vidsync.pro${playUrl}`;
     }
-
-    const trackNumber = Object.keys(tempMap[langKey]).length + 1;
-    const trackKey = `Track ${trackNumber}`;
-    const format: 'vtt' | 'srt' = item.url.toLowerCase().endsWith('.vtt') ? 'vtt' : 'srt';
-
-    tempMap[langKey][trackKey] = {
-      url: item.url,
-      format
+    return {
+      id: item.id || '',
+      url: playUrl,
+      sourceUrl: item.sourceUrl || '',
+      language: item.language || '',
+      label: item.label || '',
+      rawLanguage: item.rawLanguage || '',
+      provider: item.provider || '',
+      score: typeof item.score === 'number' ? item.score : 0,
+      format: item.format || ''
     };
-  }
+  });
 
-  const orderedResult: Record<string, Record<string, { url: string; format: 'vtt' | 'srt' }>> = {};
-
-  // First priority languages (Hindi, English, etc.)
-  for (const lang of PRIORITY_LANGUAGES) {
-    const langKey = `Language: ${lang}`;
-    if (tempMap[langKey] && Object.keys(tempMap[langKey]).length > 0) {
-      orderedResult[langKey] = tempMap[langKey];
-    }
-  }
-
-  // Any remaining languages alphabetically
-  const remainingKeys = Object.keys(tempMap)
-    .filter(k => !orderedResult[k] && Object.keys(tempMap[k]).length > 0)
-    .sort((a, b) => a.localeCompare(b));
-
-  for (const langKey of remainingKeys) {
-    orderedResult[langKey] = tempMap[langKey];
-  }
-
-  return orderedResult;
+  return {
+    identity: data?.identity || {
+      kind: 'tmdb',
+      type: isTv ? 'tv' : 'movie',
+      id: String(tmdbId),
+      tmdbId: String(tmdbId),
+      ...(isTv ? { season: season || 1, episode: episode || 1 } : {})
+    },
+    languages: Array.isArray(data?.languages) ? data.languages : [],
+    subtitles: formattedSubtitles,
+    diagnostics: Array.isArray(data?.diagnostics) ? data.diagnostics : []
+  };
 }
 
-// Subtitles - TV Show: GET /subtitles/tv/:tmdbId/:absoluteEpisode
-subtitlesRouter.get(
-  ['/tv/:tmdbId/:absoluteEpisode', '/:tmdbId/:absoluteEpisode'],
-  async (req: Request, res: Response, next) => {
-    const { tmdbId, absoluteEpisode } = req.params;
+// Subtitle file proxy route: GET /file
+subtitlesRouter.get('/file', async (req: Request, res: Response) => {
+  const fileUrl = (req.query.url as string) || '';
+  if (!fileUrl) {
+    return res.status(400).send('Missing url parameter');
+  }
 
-    if (tmdbId === 'movie') {
+  try {
+    const upstreamUrl = fileUrl.startsWith('http')
+      ? `https://vidsync.pro/api/subtitles/file?url=${encodeURIComponent(fileUrl)}`
+      : `https://vidsync.pro${fileUrl.startsWith('/') ? '' : '/'}${fileUrl}`;
+
+    const upstreamRes = await fetch(upstreamUrl, {
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Origin': 'https://vidsync.pro',
+        'Referer': 'https://vidsync.pro/'
+      },
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!upstreamRes.ok) {
+      if (fileUrl.startsWith('http')) {
+        const directRes = await fetch(fileUrl, {
+          headers: { 'User-Agent': USER_AGENT },
+          signal: AbortSignal.timeout(10000)
+        });
+        if (directRes.ok) {
+          const contentType = directRes.headers.get('content-type') || 'text/vtt; charset=utf-8';
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          const buffer = await directRes.arrayBuffer();
+          return res.send(Buffer.from(buffer));
+        }
+      }
+      return res.status(upstreamRes.status).send(`Upstream returned ${upstreamRes.status}`);
+    }
+
+    const contentType = upstreamRes.headers.get('content-type') || 'text/vtt; charset=utf-8';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    const buffer = await upstreamRes.arrayBuffer();
+    return res.send(Buffer.from(buffer));
+  } catch (err: any) {
+    return res.status(502).send(err.message || 'Failed to fetch subtitle file');
+  }
+});
+
+// Exact Vidsync mirror routes: /tmdb/tv/:tmdbId and /tmdb/movie/:tmdbId
+subtitlesRouter.get('/tmdb/tv/:tmdbId', async (req: Request, res: Response) => {
+  const { tmdbId } = req.params;
+  const sNum = parseInt((req.query.season as string) || (req.query.s as string) || '1', 10);
+  const eNum = parseInt((req.query.episode as string) || (req.query.e as string) || '1', 10);
+
+  if (!tmdbId || !/^\d+$/.test(tmdbId)) {
+    return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
+  }
+
+  try {
+    const data = await retrieveVidsyncSubtitles(tmdbId, true, sNum, eNum);
+    return res.json({
+      identity: data.identity,
+      languages: data.languages,
+      subtitles: data.subtitles,
+      diagnostics: data.diagnostics
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      success: false,
+      error: 'Failed to retrieve subtitles from Vidsync subtitles service.',
+      details: err.message || String(err)
+    });
+  }
+});
+
+subtitlesRouter.get('/tmdb/movie/:tmdbId', async (req: Request, res: Response) => {
+  const { tmdbId } = req.params;
+
+  if (!tmdbId || !/^\d+$/.test(tmdbId)) {
+    return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
+  }
+
+  try {
+    const data = await retrieveVidsyncSubtitles(tmdbId, false);
+    return res.json({
+      identity: data.identity,
+      languages: data.languages,
+      subtitles: data.subtitles,
+      diagnostics: data.diagnostics
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      success: false,
+      error: 'Failed to retrieve subtitles from Vidsync subtitles service.',
+      details: err.message || String(err)
+    });
+  }
+});
+
+// Subtitles - TV Show: GET /subtitles/tv/:tmdbId/:season/:episode (and /tv/:tmdbId?season=1&episode=1)
+subtitlesRouter.get(
+  ['/tv/:tmdbId/:season/:episode', '/tv/:tmdbId/:episode', '/tv/:tmdbId', '/:tmdbId/:season/:episode', '/:tmdbId/:episode'],
+  async (req: Request, res: Response, next: express.NextFunction) => {
+    const { tmdbId } = req.params;
+    if (tmdbId === 'movie' || tmdbId === 'file' || tmdbId === 'tmdb') {
       return next();
     }
-
-    if (!tmdbId || !/^\d+$/.test(tmdbId)) {
-      return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
-    }
-
-    const absEpNum = parseInt(absoluteEpisode, 10);
-    if (isNaN(absEpNum) || absEpNum < 1) {
-      return res.status(400).json({ success: false, error: 'Invalid absoluteEpisode. Must be a positive integer >= 1.' });
-    }
-
-    try {
-      // Subtitles resolves IMDb ID, season, and episode
-      const itMap = await resolveItMap(tmdbId, absEpNum);
-
-      if (!itMap.imdb_id) {
-        return res.status(404).json({
-          success: false,
-          error: `Could not resolve IMDb ID for TMDB TV show ${tmdbId}. External ID is missing on TMDB.`
-        });
-      }
-
-      const subtitles = await retrieveOpenSubtitles(itMap.imdb_id, true, itMap.imdb_season, itMap.imdb_episode);
-
-      return res.json({
-        success: true,
-        provider: 'Stremio OpenSubtitles v3',
-        tmdb_id: tmdbId,
-        imdb_id: itMap.imdb_id,
-        absolute_episode: absEpNum,
-        season: itMap.tmdb_season,
-        episode: itMap.tmdb_episode,
-        imdb_season: itMap.imdb_season,
-        imdb_episode: itMap.imdb_episode,
-        subtitles
-      });
-    } catch (err: any) {
-      return res.status(502).json({
-        success: false,
-        error: 'Failed to retrieve subtitles from OpenSubtitles v3 service.',
-        details: err.message || String(err)
-      });
-    }
-  }
-);
-
-// Subtitles - TV Show with explicit season & episode: GET /subtitles/tv/:tmdbId/:season/:episode
-subtitlesRouter.get(
-  ['/tv/:tmdbId/:season/:episode', '/:tmdbId/:season/:episode'],
-  async (req: Request, res: Response) => {
-    const { tmdbId, season, episode } = req.params;
+    let season = req.params.season || (req.query.season as string) || (req.query.s as string) || '1';
+    let episode = req.params.episode || (req.query.episode as string) || (req.query.e as string) || '1';
 
     if (!tmdbId || !/^\d+$/.test(tmdbId)) {
       return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
@@ -937,33 +787,29 @@ subtitlesRouter.get(
 
     const sNum = parseInt(season, 10);
     const eNum = parseInt(episode, 10);
+
     if (isNaN(sNum) || sNum < 1 || isNaN(eNum) || eNum < 1) {
       return res.status(400).json({ success: false, error: 'Invalid season or episode number. Must be positive integers >= 1.' });
     }
 
     try {
-      const ext = await fetchTmdb(`/tv/${tmdbId}/external_ids`);
-      const imdbId = ext.imdb_id || null;
-
-      if (!imdbId) {
-        return res.status(404).json({ success: false, error: `Could not resolve IMDb ID for TMDB TV show ${tmdbId}.` });
-      }
-
-      const subtitles = await retrieveOpenSubtitles(imdbId, true, sNum, eNum);
+      const data = await retrieveVidsyncSubtitles(tmdbId, true, sNum, eNum);
 
       return res.json({
         success: true,
-        provider: 'Stremio OpenSubtitles v3',
+        provider: 'Vidsync Subtitles',
         tmdb_id: tmdbId,
-        imdb_id: imdbId,
         season: sNum,
         episode: eNum,
-        subtitles
+        identity: data.identity,
+        languages: data.languages,
+        subtitles: data.subtitles,
+        diagnostics: data.diagnostics
       });
     } catch (err: any) {
       return res.status(502).json({
         success: false,
-        error: 'Failed to retrieve subtitles from OpenSubtitles v3 service.',
+        error: 'Failed to retrieve subtitles from Vidsync subtitles service.',
         details: err.message || String(err)
       });
     }
@@ -981,27 +827,820 @@ subtitlesRouter.get(
     }
 
     try {
-      const imdbId = await getMovieImdbId(tmdbId);
-
-      if (!imdbId) {
-        return res.status(404).json({ success: false, error: `Could not resolve IMDb ID for TMDB Movie ${tmdbId}.` });
-      }
-
-      const subtitles = await retrieveOpenSubtitles(imdbId, false);
+      const data = await retrieveVidsyncSubtitles(tmdbId, false);
 
       return res.json({
         success: true,
-        provider: 'Stremio OpenSubtitles v3',
+        provider: 'Vidsync Subtitles',
         tmdb_id: tmdbId,
-        imdb_id: imdbId,
-        subtitles
+        identity: data.identity,
+        languages: data.languages,
+        subtitles: data.subtitles,
+        diagnostics: data.diagnostics
       });
     } catch (err: any) {
       return res.status(502).json({
         success: false,
-        error: 'Failed to retrieve movie subtitles from OpenSubtitles v3 service.',
+        error: 'Failed to retrieve subtitles from Vidsync subtitles service.',
         details: err.message || String(err)
       });
+    }
+  }
+);
+
+// -------------------------------------------------------------
+// TMDB & IMDb Mapping System Helpers
+// -------------------------------------------------------------
+
+function cleanTitle(title: string): string {
+  if (!title) return '';
+  return title.toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+    .trim();
+}
+
+function isTitleMatch(t1: string, t2: string): boolean {
+  if (!t1 || !t2) return false;
+  const c1 = cleanTitle(t1);
+  const c2 = cleanTitle(t2);
+  return c1 === c2 || c1.includes(c2) || c2.includes(c1);
+}
+
+function parseImdbDate(dateStr: string): Date | null {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (!isNaN(d.getTime())) return d;
+  return null;
+}
+
+function parseTmdbDate(dateStr: string): Date | null {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (!isNaN(d.getTime())) return d;
+  return null;
+}
+
+function isDateMatch(date1: string, date2: string): boolean {
+  const d1 = parseImdbDate(date1);
+  const d2 = parseTmdbDate(date2);
+  if (!d1 || !d2) return false;
+  // Check if dates are within 2 days of each other
+  return Math.abs(d1.getTime() - d2.getTime()) <= 2 * 24 * 60 * 60 * 1000;
+}
+
+async function resolveDnsOverHttps(hostname: string): Promise<string[]> {
+  try {
+    const res = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`, {
+      signal: AbortSignal.timeout(3000)
+    });
+    if (!res.ok) return [];
+    const json = await res.json();
+    if (json.Answer && Array.isArray(json.Answer)) {
+      return json.Answer.filter((ans: any) => ans.type === 1).map((ans: any) => ans.data);
+    }
+  } catch (err) {
+    // Graceful fallback
+  }
+  return [];
+}
+
+/**
+ * Fetches accurate TV series episode metadata from Stremio Cinemeta API (direct from IMDb dumps)
+ */
+export async function fetchImdbEpisodesFromCinemeta(imdbId: string, seasonNum?: number) {
+  try {
+    const url = `https://v3-cinemeta.stremio.com/meta/series/${imdbId}.json`;
+    
+    // Attempt direct fetch
+    let res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.timeout(6000)
+    }).catch(() => null);
+
+    // If direct DNS resolution fails (e.g. getaddrinfo ENOTFOUND), use Google DNS-over-HTTPS fallback
+    if (!res || !res.ok) {
+      const ips = await resolveDnsOverHttps('v3-cinemeta.stremio.com');
+      if (ips && ips.length > 0) {
+        const ip = ips[0];
+        const httpUrl = `http://${ip}/meta/series/${imdbId}.json`;
+        res = await fetch(httpUrl, {
+          headers: {
+            'User-Agent': USER_AGENT,
+            'Host': 'v3-cinemeta.stremio.com'
+          },
+          signal: AbortSignal.timeout(6000)
+        }).catch(() => null);
+      }
+    }
+
+    if (!res || !res.ok) {
+      console.log(`Cinemeta API is currently offline/unreachable for ${imdbId}. Falling back to direct scraping...`);
+      return [];
+    }
+
+    const json = await res.json();
+    const videos = json.meta?.videos || [];
+
+    const episodes = videos.map((v: any) => {
+      let releasedStr = '';
+      if (v.released) {
+        const d = new Date(v.released);
+        if (!isNaN(d.getTime())) {
+          releasedStr = d.toLocaleDateString('en-US', {
+            weekday: 'short',
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric'
+          });
+        }
+      }
+      return {
+        season: v.season,
+        episode: v.episode,
+        rating: v.rating ? String(v.rating) : null,
+        episode_id: v.id || `${imdbId}:${v.season}:${v.episode}`,
+        released: releasedStr,
+        title: v.title || `Episode ${v.episode}`,
+        overview: v.overview || '',
+        thumbnail: v.thumbnail || ''
+      };
+    });
+
+    if (seasonNum !== undefined) {
+      return episodes.filter((ep: any) => ep.season === seasonNum);
+    }
+    return episodes;
+  } catch (err) {
+    console.log(`Note: Cinemeta metadata fallback in progress for ${imdbId}...`);
+    return [];
+  }
+}
+
+/**
+ * Scrapes IMDb seasons episodes page directly
+ */
+export async function scrapeImdbEpisodesList(imdbId: string, season: number) {
+  // 1. Try high-performance Stremio Cinemeta API first
+  const cinemetaEpisodes = await fetchImdbEpisodesFromCinemeta(imdbId, season);
+  if (cinemetaEpisodes && cinemetaEpisodes.length > 0) {
+    return cinemetaEpisodes;
+  }
+
+  const url = `https://www.imdb.com/title/${imdbId}/episodes?season=${season}`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.google.com/'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const $ = cheerio.load(html);
+    const episodes: any[] = [];
+
+    // Old IMDb Layout (.list_item)
+    $('.list_item').each((i, el) => {
+      const titleAnchor = $(el).find('a[itemprop="name"]');
+      const title = titleAnchor.text().trim();
+      if (!title) return;
+      const href = titleAnchor.attr('href') || '';
+      const epIdMatch = href.match(/tt\d+/);
+      const epId = epIdMatch ? epIdMatch[0] : '';
+      
+      const epNumMeta = $(el).find('meta[itemprop="episodeNumber"]');
+      const epNum = epNumMeta.attr('content') ? parseInt(epNumMeta.attr('content') || '0', 10) : i + 1;
+      
+      const ratingSpan = $(el).find('.ipl-rating-star__rating').first();
+      const rating = ratingSpan.text().trim() || null;
+      
+      const airdateDiv = $(el).find('.airdate');
+      const airdate = airdateDiv.text().trim().replace(/\s+/g, ' ');
+      
+      const descDiv = $(el).find('.item_description');
+      const overview = descDiv.text().trim();
+      
+      const img = $(el).find('.image img');
+      const thumbnail = img.attr('src') || '';
+
+      episodes.push({
+        season,
+        episode: epNum,
+        rating,
+        episode_id: epId,
+        released: airdate,
+        title,
+        overview,
+        thumbnail
+      });
+    });
+
+    // New IMDb Layout (data-testid="episode-card")
+    if (episodes.length === 0) {
+      $('[data-testid="episode-card"]').each((i, el) => {
+        const titleEl = $(el).find('[data-testid="episode-card-title"]');
+        const title = titleEl.text().trim();
+        if (!title) return;
+        const href = titleEl.attr('href') || '';
+        const epIdMatch = href.match(/tt\d+/);
+        const epId = epIdMatch ? epIdMatch[0] : '';
+
+        let epNum = i + 1;
+        const metaText = $(el).find('[data-testid="episode-card-metadata"]').text();
+        const epNumMatch = metaText.match(/E(\d+)/i);
+        if (epNumMatch) {
+          epNum = parseInt(epNumMatch[1], 10);
+        }
+
+        const rating = $(el).find('[aria-label^="IMDb rating"]').text().trim() || null;
+        const airdate = $(el).find('[data-testid="episode-card-airdate"]').text().trim() || '';
+        const overview = $(el).find('[data-testid="episode-card-plot"]').text().trim() || '';
+        const thumbnail = $(el).find('img').attr('src') || '';
+
+        episodes.push({
+          season,
+          episode: epNum,
+          rating,
+          episode_id: epId,
+          released: airdate,
+          title,
+          overview,
+          thumbnail
+        });
+      });
+    }
+
+    return episodes;
+  } catch (err) {
+    console.error(`Error scraping IMDb season ${season}:`, err);
+    return [];
+  }
+}
+
+/**
+ * Fallback to retrieve episodes directly from TMDB when IMDb scraper fails or is unavailable
+ */
+export async function getEpisodesFallbackFromTmdb(tmdbId: string, season: number) {
+  try {
+    const tmdbData = await fetchTmdb(`/tv/${tmdbId}/season/${season}`);
+    if (!tmdbData || !Array.isArray(tmdbData.episodes)) return [];
+    return tmdbData.episodes.map((ep: any) => ({
+      season,
+      episode: ep.episode_number,
+      rating: ep.vote_average ? String(ep.vote_average.toFixed(1)) : null,
+      episode_id: `tmdb_${ep.id}`,
+      released: ep.air_date || '',
+      title: ep.name || '',
+      overview: ep.overview || '',
+      thumbnail: ep.still_path ? `https://image.tmdb.org/t/p/w300${ep.still_path}` : ''
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Robustly maps user-given TMDB season/episode to IMDb season/episode by:
+ * 1. Identifying the target TMDB episode ignoring 'episode_number' (finding the E-th index of Season S)
+ * 2. Calculating the absolute episode index of the show on TMDB.
+ * 3. Checking for corresponding absolute episode index on IMDb and confirming by Title and Air Date year.
+ */
+export async function mapTmdbToImdbEpisode(
+  imdbId: string,
+  tmdbId: string,
+  sNum: number,
+  eNum: number
+): Promise<{ season: number; episode: number }> {
+  try {
+    // 1. Fetch TV show details to get all seasons
+    const showDetails = await fetchTmdb(`/tv/${tmdbId}`).catch(() => null);
+    if (!showDetails) return { season: sNum, episode: eNum };
+
+    const seasonsList = Array.isArray(showDetails.seasons)
+      ? showDetails.seasons.filter((s: any) => s.season_number > 0)
+      : [];
+
+    // 2. Fetch TMDB episodes of Season sNum
+    const tmdbSeasonData = await fetchTmdb(`/tv/${tmdbId}/season/${sNum}`).catch(() => null);
+    if (!tmdbSeasonData || !Array.isArray(tmdbSeasonData.episodes)) {
+      return { season: sNum, episode: eNum };
+    }
+
+    // Ignore 'episode_number' and get the E-th episode in the list (1-indexed)
+    const targetTmdbEp = tmdbSeasonData.episodes[eNum - 1];
+    if (!targetTmdbEp) {
+      return { season: sNum, episode: eNum };
+    }
+
+    const targetTitle = targetTmdbEp.name || '';
+    const targetAirDate = targetTmdbEp.air_date || '';
+    const targetYear = targetAirDate ? parseInt(targetAirDate.substring(0, 4), 10) : null;
+
+    // Calculate absolute index of this TMDB episode
+    let tmdbAbsoluteIndex = 0;
+    for (const s of seasonsList) {
+      if (s.season_number < sNum) {
+        tmdbAbsoluteIndex += s.episode_count;
+      }
+    }
+    tmdbAbsoluteIndex += eNum;
+
+    console.log(`Mapping TMDB S${sNum}E${eNum} (Absolute Index: ${tmdbAbsoluteIndex}, Year: ${targetYear}, Title: "${targetTitle}")`);
+
+    // 3. Search and match with IMDb episodes by absolute index first
+    let imdbAbsoluteIndex = 0;
+    for (let s = 1; s <= showDetails.number_of_seasons; s++) {
+      const imdbEpisodes = await scrapeImdbEpisodesList(imdbId, s);
+      if (imdbEpisodes && imdbEpisodes.length > 0) {
+        if (imdbAbsoluteIndex + imdbEpisodes.length >= tmdbAbsoluteIndex) {
+          const matchedEp = imdbEpisodes[tmdbAbsoluteIndex - imdbAbsoluteIndex - 1];
+          if (matchedEp) {
+            const titleMatched = targetTitle && matchedEp.title && isTitleMatch(targetTitle, matchedEp.title);
+            const imdbYear = matchedEp.released ? parseImdbDate(matchedEp.released)?.getFullYear() : null;
+            const yearMatches = targetYear && imdbYear && Math.abs(targetYear - imdbYear) <= 1;
+
+            if (titleMatched || yearMatches || showDetails.name?.toLowerCase().includes('piece')) {
+              console.log(`Matched by absolute index: S${s}E${matchedEp.episode} ("${matchedEp.title}")`);
+              return { season: s, episode: matchedEp.episode };
+            }
+          }
+        }
+        imdbAbsoluteIndex += imdbEpisodes.length;
+      }
+    }
+
+    // 4. Fallback to Title & Date matching across seasons
+    const seasonsToCheck = Array.from(new Set([sNum, 1, sNum - 1, sNum + 1])).filter(s => s >= 1);
+    for (const imdbSeason of seasonsToCheck) {
+      const imdbEpisodes = await scrapeImdbEpisodesList(imdbId, imdbSeason);
+      if (imdbEpisodes && imdbEpisodes.length > 0) {
+        for (const ep of imdbEpisodes) {
+          const titleMatched = targetTitle && ep.title && isTitleMatch(targetTitle, ep.title);
+          const imdbYear = ep.released ? parseImdbDate(ep.released)?.getFullYear() : null;
+          const yearMatches = targetYear && imdbYear && targetYear === imdbYear;
+
+          if (titleMatched && yearMatches) {
+            console.log(`Matched by title and year: S${imdbSeason}E${ep.episode} ("${ep.title}")`);
+            return { season: imdbSeason, episode: ep.episode };
+          }
+        }
+      }
+    }
+
+    return { season: sNum, episode: eNum };
+  } catch (err) {
+    console.error("Error mapping TMDB to IMDb:", err);
+    return { season: sNum, episode: eNum };
+  }
+}
+
+// -------------------------------------------------------------
+// IMDb Episodes Finder Routes (For website's search tab)
+// -------------------------------------------------------------
+
+imdbRouter.get(
+  '/id/:imdbId',
+  async (req: Request, res: Response) => {
+    const { imdbId } = req.params;
+    const seasonQuery = req.query.season;
+
+    if (!imdbId.startsWith('tt')) {
+      return res.status(400).json({ success: false, error: 'Invalid IMDb ID format. Must start with "tt".' });
+    }
+
+    try {
+      let episodes = await fetchImdbEpisodesFromCinemeta(imdbId);
+      if (!episodes || episodes.length === 0) {
+        // Fallback to direct scraping if Cinemeta fails
+        for (let s = 1; s <= 5; s++) {
+          const scraped = await scrapeImdbEpisodesList(imdbId, s);
+          if (scraped && scraped.length > 0) {
+            episodes.push(...scraped);
+          } else {
+            break;
+          }
+        }
+      }
+
+      if (seasonQuery) {
+        const sVal = parseInt(String(seasonQuery), 10);
+        if (!isNaN(sVal) && sVal > 0) {
+          episodes = episodes.filter((ep: any) => ep.season === sVal);
+        }
+      }
+
+      const formattedEpisodes = episodes.map((ep: any) => ({
+        season: String(ep.season),
+        ep: String(ep.episode),
+        [`ep${ep.episode}`]: String(ep.episode),
+        title: ep.title,
+        released: ep.released,
+        episode_id: ep.episode_id,
+        overview: ep.overview,
+        thumbnail: ep.thumbnail
+      }));
+
+      return res.json({
+        success: true,
+        imdb_id: imdbId,
+        episodes: formattedEpisodes
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err.message || String(err) });
+    }
+  }
+);
+
+imdbRouter.all(
+  ['/episodes', '/episodes/:id'],
+  async (req: Request, res: Response) => {
+    let id = req.params.id || req.query.id || req.body.id;
+    let seasonParam = req.query.season || req.body.season;
+
+    if (typeof id !== 'string') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid series ID.' });
+    }
+
+    id = id.trim();
+
+    // Extract IMDb ID if full URL is given
+    if (id.includes('imdb.com/title/')) {
+      const match = id.match(/tt\d+/);
+      if (match) id = match[0];
+    }
+
+    try {
+      let tmdbId = '';
+      let imdbId = '';
+      let showDetails: any = null;
+      let isMovie = false;
+
+      if (id.startsWith('tt')) {
+        imdbId = id;
+        // Find TMDB show from IMDb ID
+        const findData = await fetchTmdb(`/find/${imdbId}?external_source=imdb_id`).catch(() => null);
+        if (findData) {
+          if (Array.isArray(findData.tv_results) && findData.tv_results.length > 0) {
+            tmdbId = String(findData.tv_results[0].id);
+          } else if (Array.isArray(findData.movie_results) && findData.movie_results.length > 0) {
+            tmdbId = String(findData.movie_results[0].id);
+            isMovie = true;
+          }
+        }
+      } else if (/^\d+$/.test(id)) {
+        tmdbId = id;
+      }
+
+      if (!tmdbId) {
+        return res.status(404).json({ success: false, error: `Could not resolve TMDB entry for ID ${id}` });
+      }
+
+      if (isMovie) {
+        const movieData = await fetchTmdb(`/movie/${tmdbId}`);
+        return res.json({
+          success: true,
+          is_movie: true,
+          imdb_id: movieData.imdb_id || imdbId,
+          tmdb_id: tmdbId,
+          title: movieData.title,
+          poster: movieData.poster_path ? `https://image.tmdb.org/t/p/w500${movieData.poster_path}` : null,
+          year: movieData.release_date ? movieData.release_date.substring(0, 4) : null,
+          rating: movieData.vote_average ? movieData.vote_average.toFixed(1) : null,
+          description: movieData.overview,
+          genres: Array.isArray(movieData.genres) ? movieData.genres.map((g: any) => g.name) : []
+        });
+      }
+
+      // Fetch TV show details
+      showDetails = await fetchTmdb(`/tv/${tmdbId}`);
+      if (!imdbId) {
+        const ext = await fetchTmdb(`/tv/${tmdbId}/external_ids`).catch(() => null);
+        imdbId = ext?.imdb_id || '';
+      }
+
+      const genres = Array.isArray(showDetails.genres) ? showDetails.genres.map((g: any) => g.name) : [];
+      const poster = showDetails.poster_path ? `https://image.tmdb.org/t/p/w500${showDetails.poster_path}` : null;
+      const year = showDetails.first_air_date ? showDetails.first_air_date.substring(0, 4) : null;
+      const rating = showDetails.vote_average ? showDetails.vote_average.toFixed(1) : null;
+      const description = showDetails.overview || '';
+
+      // Seasons list excluding Season 0 (Specials)
+      const seasonsList = Array.isArray(showDetails.seasons)
+        ? showDetails.seasons.filter((s: any) => s.season_number > 0)
+        : [];
+
+      const seasonsSummary = seasonsList.map((s: any) => ({
+        season: s.season_number,
+        name: s.name || `Season ${s.season_number}`,
+        episode_count: s.episode_count
+      }));
+
+      // Determine seasons to fetch
+      let targetSeasons: number[] = [];
+      if (seasonParam) {
+        const sVal = parseInt(String(seasonParam), 10);
+        if (!isNaN(sVal) && sVal > 0) {
+          targetSeasons = [sVal];
+        }
+      } else {
+        // Fetch all seasons, caps at first 10 seasons to avoid gateway timeouts
+        targetSeasons = seasonsList.map((s: any) => s.season_number);
+        if (targetSeasons.length > 10) {
+          targetSeasons = targetSeasons.slice(0, 10);
+        }
+      }
+
+      const seasonsData: any[] = [];
+
+      for (const sNum of targetSeasons) {
+        let episodes: any[] = [];
+        if (imdbId) {
+          episodes = await scrapeImdbEpisodesList(imdbId, sNum);
+        }
+
+        // Fallback to TMDB if scraper is empty or failed
+        if (!episodes || episodes.length === 0) {
+          episodes = await getEpisodesFallbackFromTmdb(tmdbId, sNum);
+        }
+
+        const originalSeasonInfo = seasonsList.find((s: any) => s.season_number === sNum);
+
+        seasonsData.push({
+          season: sNum,
+          name: originalSeasonInfo?.name || `Season ${sNum}`,
+          total_episodes: episodes.length,
+          episodes
+        });
+      }
+
+      return res.json({
+        success: true,
+        imdb_id: imdbId,
+        tmdb_id: tmdbId,
+        title: showDetails.name || showDetails.original_name,
+        poster,
+        year,
+        rating,
+        description,
+        total_seasons: showDetails.number_of_seasons,
+        total_episodes: showDetails.number_of_episodes,
+        genres,
+        seasons_summary: seasonsSummary,
+        seasons: seasonsData
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to retrieve IMDb season & episode data.',
+        details: err.message || String(err)
+      });
+    }
+  }
+);
+
+// Match individual episode: GET /imdb/:tmdbId/:season/:ep
+imdbRouter.get(
+  '/:tmdbId/:season/:ep',
+  async (req: Request, res: Response) => {
+    let { tmdbId, season, ep } = req.params;
+    if (tmdbId === 'episodes') {
+      return res.status(400).json({ success: false, error: 'Invalid route parameter usage.' });
+    }
+    
+    const sNum = parseInt(season, 10);
+    const eNum = parseInt(ep, 10);
+    if (isNaN(sNum) || isNaN(eNum)) {
+      return res.status(400).json({ success: false, error: 'Invalid season or episode format' });
+    }
+
+    try {
+      let imdbId = '';
+      if (tmdbId.startsWith('tt')) {
+        imdbId = tmdbId;
+        const findData = await fetchTmdb(`/find/${imdbId}?external_source=imdb_id`).catch(() => null);
+        if (findData && Array.isArray(findData.tv_results) && findData.tv_results.length > 0) {
+          tmdbId = String(findData.tv_results[0].id);
+        } else {
+          return res.status(404).json({ success: false, error: `Could not resolve TMDB ID for IMDb ${imdbId}` });
+        }
+      } else {
+        const ext = await fetchTmdb(`/tv/${tmdbId}/external_ids`).catch(() => null);
+        imdbId = ext?.imdb_id || '';
+      }
+
+      // Fetch TMDB season details
+      const tmdbSeasonData = await fetchTmdb(`/tv/${tmdbId}/season/${sNum}`).catch(() => null);
+      if (!tmdbSeasonData || !Array.isArray(tmdbSeasonData.episodes)) {
+        return res.status(404).json({ success: false, error: `Season ${sNum} not found in TMDB` });
+      }
+
+      // Find the E-th episode in TMDB list (1-indexed, i.e., index ep - 1)
+      const targetTmdbEp = tmdbSeasonData.episodes[eNum - 1];
+      if (!targetTmdbEp) {
+        return res.status(404).json({ success: false, error: `Episode index ${eNum} not found in TMDB Season ${sNum}` });
+      }
+
+      const targetTitle = targetTmdbEp.name || '';
+      const targetAirDate = targetTmdbEp.air_date || '';
+
+      // Match on IMDb
+      let match = false;
+      let matchedImdbSeason = sNum;
+      let matchedImdbEpisode = eNum;
+      let matchedImdbTitle = '';
+      let matchedImdbReleased = '';
+      let matchedImdbEpId = '';
+
+      const seasonsToCheck = Array.from(new Set([sNum, 1, sNum - 1, sNum + 1])).filter(s => s >= 1);
+
+      for (const imdbSeason of seasonsToCheck) {
+        const imdbEpisodes = await scrapeImdbEpisodesList(imdbId, imdbSeason);
+        if (imdbEpisodes && imdbEpisodes.length > 0) {
+          for (const epItem of imdbEpisodes) {
+            const titleMatched = targetTitle && epItem.title && isTitleMatch(targetTitle, epItem.title);
+            const dateMatched = targetAirDate && epItem.released && isDateMatch(targetAirDate, epItem.released);
+
+            if (titleMatched || dateMatched) {
+              match = true;
+              matchedImdbSeason = imdbSeason;
+              matchedImdbEpisode = epItem.episode;
+              matchedImdbTitle = epItem.title;
+              matchedImdbReleased = epItem.released;
+              matchedImdbEpId = epItem.episode_id;
+              break;
+            }
+          }
+        }
+        if (match) break;
+      }
+
+      if (!match) {
+        // Continuous series absolute index check (e.g. One Piece)
+        const imdbSeason1 = await scrapeImdbEpisodesList(imdbId, 1);
+        if (imdbSeason1 && imdbSeason1.length > 0) {
+          const absEpNum = targetTmdbEp.episode_number;
+          const matchedEp = imdbSeason1.find(epItem => epItem.episode === absEpNum);
+          if (matchedEp) {
+            match = true;
+            matchedImdbSeason = 1;
+            matchedImdbEpisode = absEpNum;
+            matchedImdbTitle = matchedEp.title;
+            matchedImdbReleased = matchedEp.released;
+            matchedImdbEpId = matchedEp.episode_id;
+          }
+        }
+      }
+
+      return res.json({
+        success: true,
+        match,
+        tmdb_id: tmdbId,
+        imdb_id: imdbId,
+        tmdb_season: sNum,
+        tmdb_episode_index: eNum,
+        tmdb_episode_number: targetTmdbEp.episode_number,
+        tmdb_title: targetTitle,
+        tmdb_air_date: targetAirDate,
+        imdb_season: matchedImdbSeason,
+        imdb_episode: matchedImdbEpisode,
+        imdb_title: matchedImdbTitle || targetTitle,
+        imdb_released: matchedImdbReleased || targetAirDate,
+        imdb_episode_id: matchedImdbEpId,
+        season: String(matchedImdbSeason),
+        ep: String(matchedImdbEpisode),
+        [`ep${matchedImdbEpisode}`]: String(matchedImdbEpisode),
+        title: matchedImdbTitle || targetTitle,
+        released: matchedImdbReleased || targetAirDate
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err.message || String(err) });
+    }
+  }
+);
+
+// Map entire TMDB TV Show to IMDb episodes: GET /imdb/:tmdbId
+imdbRouter.get(
+  '/:tmdbId',
+  async (req: Request, res: Response) => {
+    let { tmdbId } = req.params;
+    if (tmdbId === 'episodes') {
+      return res.status(400).json({ success: false, error: 'Invalid route parameter usage.' });
+    }
+    const seasonQuery = req.query.season;
+
+    try {
+      let imdbId = '';
+      if (tmdbId.startsWith('tt')) {
+        imdbId = tmdbId;
+        const findData = await fetchTmdb(`/find/${imdbId}?external_source=imdb_id`).catch(() => null);
+        if (findData && Array.isArray(findData.tv_results) && findData.tv_results.length > 0) {
+          tmdbId = String(findData.tv_results[0].id);
+        } else {
+          return res.status(404).json({ success: false, error: `Could not resolve TMDB ID for IMDb ${imdbId}` });
+        }
+      } else {
+        const ext = await fetchTmdb(`/tv/${tmdbId}/external_ids`).catch(() => null);
+        imdbId = ext?.imdb_id || '';
+      }
+
+      // Fetch show details
+      const showDetails = await fetchTmdb(`/tv/${tmdbId}`);
+      if (!showDetails) {
+        return res.status(404).json({ success: false, error: 'TV show not found' });
+      }
+
+      // Get target seasons to map
+      let targetSeasons: number[] = [];
+      if (seasonQuery) {
+        const sVal = parseInt(String(seasonQuery), 10);
+        if (!isNaN(sVal) && sVal > 0) {
+          targetSeasons = [sVal];
+        }
+      } else {
+        // Fetch seasons (limit to first 10 seasons by default to prevent gateway timeout)
+        const seasonsList = Array.isArray(showDetails.seasons)
+          ? showDetails.seasons.filter((s: any) => s.season_number > 0)
+          : [];
+        targetSeasons = seasonsList.map((s: any) => s.season_number);
+        if (targetSeasons.length > 10) {
+          targetSeasons = targetSeasons.slice(0, 10);
+        }
+      }
+
+      const allMappedEpisodes: any[] = [];
+
+      for (const sNum of targetSeasons) {
+        const tmdbSeasonData = await fetchTmdb(`/tv/${tmdbId}/season/${sNum}`).catch(() => null);
+        if (!tmdbSeasonData || !Array.isArray(tmdbSeasonData.episodes)) continue;
+
+        // Scrape IMDb episodes for this season
+        const imdbEpisodes = await scrapeImdbEpisodesList(imdbId, sNum).catch(() => []);
+
+        // Scrape Season 1 for absolute index fallback
+        const imdbSeason1 = (sNum !== 1) ? await scrapeImdbEpisodesList(imdbId, 1).catch(() => []) : imdbEpisodes;
+
+        // Map each episode of this TMDB season
+        for (let idx = 0; idx < tmdbSeasonData.episodes.length; idx++) {
+          const tmdbEp = tmdbSeasonData.episodes[idx];
+          const targetTitle = tmdbEp.name || '';
+          const targetAirDate = tmdbEp.air_date || '';
+
+          // Look for title/date match in this IMDb season
+          let match = false;
+          let matchedImdbSeason = sNum;
+          let matchedImdbEpisode = idx + 1;
+          let matchedImdbTitle = targetTitle;
+          let matchedImdbReleased = targetAirDate;
+
+          for (const epItem of imdbEpisodes) {
+            const titleMatched = targetTitle && epItem.title && isTitleMatch(targetTitle, epItem.title);
+            const dateMatched = targetAirDate && epItem.released && isDateMatch(targetAirDate, epItem.released);
+            if (titleMatched || dateMatched) {
+              match = true;
+              matchedImdbSeason = sNum;
+              matchedImdbEpisode = epItem.episode;
+              matchedImdbTitle = epItem.title;
+              matchedImdbReleased = epItem.released;
+              break;
+            }
+          }
+
+          if (!match && imdbSeason1 && imdbSeason1.length > 0) {
+            const absEpNum = tmdbEp.episode_number;
+            const matchedEp = imdbSeason1.find(epItem => epItem.episode === absEpNum);
+            if (matchedEp) {
+              match = true;
+              matchedImdbSeason = 1;
+              matchedImdbEpisode = absEpNum;
+              matchedImdbTitle = matchedEp.title;
+              matchedImdbReleased = matchedEp.released;
+            }
+          }
+
+          allMappedEpisodes.push({
+            season: String(matchedImdbSeason),
+            [`ep${matchedImdbEpisode}`]: String(matchedImdbEpisode),
+            ep: String(matchedImdbEpisode),
+            title: matchedImdbTitle,
+            released: matchedImdbReleased,
+            tmdb_title: targetTitle,
+            tmdb_air_date: targetAirDate,
+            match
+          });
+        }
+      }
+
+      return res.json({
+        success: true,
+        imdb_id: imdbId,
+        tmdb_id: tmdbId,
+        title: showDetails.name || showDetails.original_name,
+        episodes: allMappedEpisodes
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err.message || String(err) });
     }
   }
 );
