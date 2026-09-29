@@ -106,11 +106,35 @@ async function startServer() {
           parameters: [
             { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Show ID" },
             { name: "season", in: "path", required: true, schema: { type: "integer" }, description: "Season number" },
-            { name: "episode", in: "path", required: true, schema: { type: "integer" }, description: "Episode number" }
+            { name: "episode", in: "path", required: true, schema: { type: "integer" }, description: "Episode number" },
+            { name: "lang", in: "query", required: false, schema: { type: "string", default: "en" }, description: "Filter language code or 'all'" }
           ],
           responses: {
             200: {
-              description: "Complete list of subtitles from Vidsync with identity, languages, and tracks"
+              description: "Single language subtitle tracks (default English) with Track 1, Track 2 structure",
+              content: {
+                "application/json": {
+                  example: {
+                    success: true,
+                    provider: "Vidsync Subtitles",
+                    tmdb_id: "278043",
+                    season: 1,
+                    episode: 1,
+                    subtitles: {
+                      "Language: English": {
+                        "Track 1": {
+                          "url": "https://vidsync.pro/api/subtitles/file?url=...",
+                          "format": "vtt"
+                        },
+                        "Track 2": {
+                          "url": "https://vidsync.pro/api/subtitles/file?url=...",
+                          "format": "vtt"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -119,11 +143,33 @@ async function startServer() {
         get: {
           summary: "Vidsync Subtitles for Movie",
           parameters: [
-            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Movie ID" }
+            { name: "tmdbId", in: "path", required: true, schema: { type: "string" }, description: "TMDB Movie ID" },
+            { name: "lang", in: "query", required: false, schema: { type: "string", default: "en" }, description: "Filter language code or 'all'" }
           ],
           responses: {
             200: {
-              description: "Complete list of subtitles from Vidsync with identity, languages, and tracks"
+              description: "Single language subtitle tracks (default English) with Track 1, Track 2 structure",
+              content: {
+                "application/json": {
+                  example: {
+                    success: true,
+                    provider: "Vidsync Subtitles",
+                    tmdb_id: "1726",
+                    subtitles: {
+                      "Language: English": {
+                        "Track 1": {
+                          "url": "https://vidsync.pro/api/subtitles/file?url=...",
+                          "format": "vtt"
+                        },
+                        "Track 2": {
+                          "url": "https://vidsync.pro/api/subtitles/file?url=...",
+                          "format": "vtt"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }

@@ -612,7 +612,13 @@ vidsyncRouter.get(
 // Subtitles - Vidsync (With TMDB API)
 // -------------------------------------------------------------
 
-export async function retrieveVidsyncSubtitles(tmdbId: string, isTv: boolean, season?: number, episode?: number) {
+export async function retrieveVidsyncSubtitles(
+  tmdbId: string,
+  isTv: boolean,
+  season?: number,
+  episode?: number,
+  requestedLang?: string
+) {
   const subtitleUrl = isTv
     ? `https://vidsync.pro/api/subtitles/tmdb/tv/${tmdbId}?season=${season || 1}&episode=${episode || 1}`
     : `https://vidsync.pro/api/subtitles/tmdb/movie/${tmdbId}`;
@@ -638,36 +644,89 @@ export async function retrieveVidsyncSubtitles(tmdbId: string, isTv: boolean, se
     ? data
     : [];
 
-  const formattedSubtitles = list.map((item: any) => {
-    let playUrl = item.url || '';
-    if (playUrl && playUrl.startsWith('/')) {
-      playUrl = `https://vidsync.pro${playUrl}`;
-    }
-    return {
-      id: item.id || '',
-      url: playUrl,
-      sourceUrl: item.sourceUrl || '',
-      language: item.language || '',
-      label: item.label || '',
-      rawLanguage: item.rawLanguage || '',
-      provider: item.provider || '',
-      score: typeof item.score === 'number' ? item.score : 0,
-      format: item.format || ''
-    };
-  });
+  // Group subtitles by Language: <LanguageName>
+  const tempMap: Record<string, Record<string, { url: string; format: 'vtt' | 'srt' }>> = {};
+  const seenUrlsPerLang: Record<string, Set<string>> = {};
 
-  return {
-    identity: data?.identity || {
-      kind: 'tmdb',
-      type: isTv ? 'tv' : 'movie',
-      id: String(tmdbId),
-      tmdbId: String(tmdbId),
-      ...(isTv ? { season: season || 1, episode: episode || 1 } : {})
-    },
-    languages: Array.isArray(data?.languages) ? data.languages : [],
-    subtitles: formattedSubtitles,
-    diagnostics: Array.isArray(data?.diagnostics) ? data.diagnostics : []
-  };
+  for (const item of list) {
+    let playUrl = item.url || '';
+    if (playUrl.startsWith('/')) {
+      playUrl = `https://vidsync.pro${playUrl}`;
+    } else if (!playUrl && item.sourceUrl) {
+      playUrl = `https://vidsync.pro/api/subtitles/file?url=${encodeURIComponent(item.sourceUrl)}`;
+    }
+    if (!playUrl) continue;
+
+    const rawLang = item.language || item.rawLanguage || item.label || 'en';
+    const langName = normalizeLanguageName(rawLang, 'English');
+    const langKey = `Language: ${langName}`;
+
+    if (!tempMap[langKey]) {
+      tempMap[langKey] = {};
+      seenUrlsPerLang[langKey] = new Set();
+    }
+
+    if (seenUrlsPerLang[langKey].has(playUrl)) {
+      continue;
+    }
+    seenUrlsPerLang[langKey].add(playUrl);
+
+    const trackNumber = Object.keys(tempMap[langKey]).length + 1;
+    const trackKey = `Track ${trackNumber}`;
+    let format: 'vtt' | 'srt' = 'vtt';
+    if (item.format === 'srt' || playUrl.toLowerCase().includes('.srt')) {
+      format = 'srt';
+    }
+
+    tempMap[langKey][trackKey] = {
+      url: playUrl,
+      format
+    };
+  }
+
+  // Filter or select single language requested or default to English
+  const reqLower = (requestedLang || '').trim().toLowerCase();
+  let finalSubtitles: Record<string, Record<string, { url: string; format: 'vtt' | 'srt' }>> = {};
+
+  if (reqLower === 'all') {
+    for (const pLang of PRIORITY_LANGUAGES) {
+      const k = `Language: ${pLang}`;
+      if (tempMap[k] && Object.keys(tempMap[k]).length > 0) {
+        finalSubtitles[k] = tempMap[k];
+      }
+    }
+    for (const k of Object.keys(tempMap).sort((a, b) => a.localeCompare(b))) {
+      if (!finalSubtitles[k]) {
+        finalSubtitles[k] = tempMap[k];
+      }
+    }
+  } else if (reqLower) {
+    const norm = normalizeLanguageName(reqLower, '');
+    let matchedKey = '';
+    if (norm && tempMap[`Language: ${norm}`]) {
+      matchedKey = `Language: ${norm}`;
+    } else {
+      matchedKey = Object.keys(tempMap).find(k => {
+        const name = k.replace(/^Language:\s*/i, '').toLowerCase();
+        return name === reqLower;
+      }) || '';
+    }
+    if (matchedKey && tempMap[matchedKey]) {
+      finalSubtitles[matchedKey] = tempMap[matchedKey];
+    }
+  } else {
+    // Default: Single language (English, identical to previous OpenSubtitles output)
+    if (tempMap['Language: English'] && Object.keys(tempMap['Language: English']).length > 0) {
+      finalSubtitles['Language: English'] = tempMap['Language: English'];
+    } else {
+      const firstAvailable = Object.keys(tempMap)[0];
+      if (firstAvailable) {
+        finalSubtitles[firstAvailable] = tempMap[firstAvailable];
+      }
+    }
+  }
+
+  return finalSubtitles;
 }
 
 // Subtitle file proxy route: GET /file
@@ -724,18 +783,21 @@ subtitlesRouter.get('/tmdb/tv/:tmdbId', async (req: Request, res: Response) => {
   const { tmdbId } = req.params;
   const sNum = parseInt((req.query.season as string) || (req.query.s as string) || '1', 10);
   const eNum = parseInt((req.query.episode as string) || (req.query.e as string) || '1', 10);
+  const langQuery = (req.query.lang as string) || (req.query.language as string) || '';
 
   if (!tmdbId || !/^\d+$/.test(tmdbId)) {
     return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
   }
 
   try {
-    const data = await retrieveVidsyncSubtitles(tmdbId, true, sNum, eNum);
+    const subtitles = await retrieveVidsyncSubtitles(tmdbId, true, sNum, eNum, langQuery);
     return res.json({
-      identity: data.identity,
-      languages: data.languages,
-      subtitles: data.subtitles,
-      diagnostics: data.diagnostics
+      success: true,
+      provider: 'Vidsync Subtitles',
+      tmdb_id: tmdbId,
+      season: sNum,
+      episode: eNum,
+      subtitles
     });
   } catch (err: any) {
     return res.status(502).json({
@@ -748,18 +810,19 @@ subtitlesRouter.get('/tmdb/tv/:tmdbId', async (req: Request, res: Response) => {
 
 subtitlesRouter.get('/tmdb/movie/:tmdbId', async (req: Request, res: Response) => {
   const { tmdbId } = req.params;
+  const langQuery = (req.query.lang as string) || (req.query.language as string) || '';
 
   if (!tmdbId || !/^\d+$/.test(tmdbId)) {
     return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
   }
 
   try {
-    const data = await retrieveVidsyncSubtitles(tmdbId, false);
+    const subtitles = await retrieveVidsyncSubtitles(tmdbId, false, undefined, undefined, langQuery);
     return res.json({
-      identity: data.identity,
-      languages: data.languages,
-      subtitles: data.subtitles,
-      diagnostics: data.diagnostics
+      success: true,
+      provider: 'Vidsync Subtitles',
+      tmdb_id: tmdbId,
+      subtitles
     });
   } catch (err: any) {
     return res.status(502).json({
@@ -780,6 +843,7 @@ subtitlesRouter.get(
     }
     let season = req.params.season || (req.query.season as string) || (req.query.s as string) || '1';
     let episode = req.params.episode || (req.query.episode as string) || (req.query.e as string) || '1';
+    const langQuery = (req.query.lang as string) || (req.query.language as string) || '';
 
     if (!tmdbId || !/^\d+$/.test(tmdbId)) {
       return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
@@ -793,7 +857,7 @@ subtitlesRouter.get(
     }
 
     try {
-      const data = await retrieveVidsyncSubtitles(tmdbId, true, sNum, eNum);
+      const subtitles = await retrieveVidsyncSubtitles(tmdbId, true, sNum, eNum, langQuery);
 
       return res.json({
         success: true,
@@ -801,10 +865,7 @@ subtitlesRouter.get(
         tmdb_id: tmdbId,
         season: sNum,
         episode: eNum,
-        identity: data.identity,
-        languages: data.languages,
-        subtitles: data.subtitles,
-        diagnostics: data.diagnostics
+        subtitles
       });
     } catch (err: any) {
       return res.status(502).json({
@@ -821,22 +882,20 @@ subtitlesRouter.get(
   ['/movie/:tmdbId', '/:tmdbId'],
   async (req: Request, res: Response) => {
     const { tmdbId } = req.params;
+    const langQuery = (req.query.lang as string) || (req.query.language as string) || '';
 
     if (!tmdbId || !/^\d+$/.test(tmdbId)) {
       return res.status(400).json({ success: false, error: 'Invalid or missing tmdbId. Must be numeric.' });
     }
 
     try {
-      const data = await retrieveVidsyncSubtitles(tmdbId, false);
+      const subtitles = await retrieveVidsyncSubtitles(tmdbId, false, undefined, undefined, langQuery);
 
       return res.json({
         success: true,
         provider: 'Vidsync Subtitles',
         tmdb_id: tmdbId,
-        identity: data.identity,
-        languages: data.languages,
-        subtitles: data.subtitles,
-        diagnostics: data.diagnostics
+        subtitles
       });
     } catch (err: any) {
       return res.status(502).json({
